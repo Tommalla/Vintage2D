@@ -30,3 +30,10 @@
 
 # Debug files
 *.dSYM/
+
+# Misc (kernel-module related)
+*.cmd
+.tmp_versions
+*.symvers
+*.order
+v2d_mod.mod.c
