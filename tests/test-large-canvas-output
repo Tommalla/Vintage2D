@@ -1,0 +1,12 @@
+#!/usr/bin/python
+
+import sys
+
+for y in xrange(1024):
+    sys.stdout.write('FF ' * 1024)
+    sys.stdout.write('00 ' * 1024)
+    sys.stdout.write('\n')
+for y in xrange(1024):
+    sys.stdout.write('00 ' * 1024)
+    sys.stdout.write('FF ' * 1024)
+    sys.stdout.write('\n')

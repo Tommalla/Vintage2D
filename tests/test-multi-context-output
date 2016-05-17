@@ -1,0 +1,18 @@
+#!/usr/bin/python
+
+import sys
+
+size = 2048
+
+def cross(size, color, bg):
+    for x in xrange(size):
+        l = min(x, size-1-x)
+        r = max(x, size-1-x)
+        sys.stdout.write(bg * l)
+        sys.stdout.write(color)
+        sys.stdout.write(bg * (r-l-1))
+        sys.stdout.write(color)
+        sys.stdout.write(bg * (size-r-1))
+        sys.stdout.write('\n')
+cross(2048, '3F ', '11 ')
+cross(1024, '17 ', 'CC ')

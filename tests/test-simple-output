@@ -1,0 +1,12 @@
+#!/usr/bin/python
+
+import sys
+
+for x in xrange(5):
+    sys.stdout.write('FF ' * 5)
+    sys.stdout.write('00 ' * 5)
+    sys.stdout.write('\n')
+for x in xrange(5):
+    sys.stdout.write('00 ' * 5)
+    sys.stdout.write('FF ' * 5)
+    sys.stdout.write('\n')

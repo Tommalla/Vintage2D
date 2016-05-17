@@ -1,0 +1,16 @@
+#!/usr/bin/python
+
+import sys
+
+size = 2048
+
+for x in xrange(size):
+    l = min(x, size-1-x)
+    r = max(x, size-1-x)
+    sys.stdout.write('00 ' * l)
+    sys.stdout.write('FF ')
+    sys.stdout.write('00 ' * (r-l-1))
+    sys.stdout.write('FF ')
+    sys.stdout.write('00 ' * (size-r-1))
+    sys.stdout.write('\n')
+

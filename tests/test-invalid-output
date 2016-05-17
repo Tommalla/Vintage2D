@@ -1,0 +1,19 @@
+#!/usr/bin/python
+
+import sys
+
+for x in xrange(5):
+    sys.stdout.write('00 ' * 100 + '\n')
+
+for x in xrange(45):
+    sys.stdout.write('00 ' * 5)
+    sys.stdout.write('FF ' * 50)
+    sys.stdout.write('00 ' * 45 + '\n')
+
+for x in xrange(5):
+    sys.stdout.write('00 ' * 5)
+    sys.stdout.write('FF ' * 95 + '\n')
+
+for x in xrange(45):
+    sys.stdout.write('00 ' * 50)
+    sys.stdout.write('FF ' * 50 + '\n')
