@@ -56,6 +56,14 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     return 0;
 }
 
+static int v2d_mmap(struct file *f, struct vm_area_struct *vm_area) {
+    return 0;
+}
+
+static int v2d_fsync(struct file *f, loff_t a, loff_t b, int datasync) {
+    return 0;
+}
+
 static struct file_operations v2d_fops = {
     .owner = THIS_MODULE,
     .open = v2d_open,
@@ -63,6 +71,8 @@ static struct file_operations v2d_fops = {
     .read = v2d_read,
     .write = v2d_write,
     .unlocked_ioctl = v2d_ioctl,
+    .mmap = v2d_mmap,
+    .fsync = v2d_fsync,
 };
 
 static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
