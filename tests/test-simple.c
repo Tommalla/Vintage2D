@@ -12,6 +12,7 @@ int main(int argc, char **argv) {
         perror("v2d_prepare");
         exit(1);
     }
+    printf("Initialized...\n");
     canvas = v2d_mmap(fd, 10, 10);
     if (canvas == MAP_FAILED) {
         perror("mmap");

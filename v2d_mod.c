@@ -19,6 +19,7 @@
 #include "v2d_ioctl.h"
 
 MODULE_LICENSE("GPL");
+#define V2D_UNINITIALIZED_ERR "Trying to use driver before initializing context with canvas size."
 
 #define V2D_MAX_COUNT 256
 
@@ -34,6 +35,9 @@ struct v2d_data {
 
 struct v2d_user {
     struct v2d_data *v2ddev;
+    // Context data:
+    int initialized;
+    struct v2d_ioctl_set_dimensions dimm;
     // TODO context and whatnot
 };
 
@@ -42,15 +46,16 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
 }
 
 static int v2d_open(struct inode *i, struct file *f) {
-    printk(KERN_NOTICE "v2dopen...");
     struct v2d_data *v2ddev;
     struct v2d_user *u;
 
+    printk(KERN_NOTICE "v2dopen...");
     v2ddev = container_of(i->i_cdev, struct v2d_data, cdev);
     u = kmalloc(sizeof(struct v2d_user), GFP_KERNEL);
     if (!u)
         return -ENOMEM;
     u->v2ddev = v2ddev;
+    u->initialized = 0;
     f->private_data = u;
     return 0;
 }
@@ -62,22 +67,72 @@ static int v2d_release(struct inode *i, struct file *f) {
 }
 
 static ssize_t v2d_read(struct file *f, char __user *buf, size_t size, loff_t *off) {
+    struct v2d_user *u;
+
+    u = f->private_data;
+    if (!u->initialized) {
+        printk(KERN_ERR V2D_UNINITIALIZED_ERR);
+        return -EINVAL;
+    }
+
     return 0;
 }
 
 static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, loff_t *off) {
+    struct v2d_user *u;
+
+    u = f->private_data;
+    if (!u->initialized) {
+        printk(KERN_ERR V2D_UNINITIALIZED_ERR);
+        return -EINVAL;
+    }
+
     return 0;
 }
 
 static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
+    struct v2d_user *u;
+    u = f->private_data;
+
+    if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
+        printk(KERN_ERR "ioctl used for an unknown command: %u", cmd);
+        return -EINVAL;
+    }
+
+    if (u->initialized) {
+        printk(KERN_ERR "trying to set canvas dimensions for the second time");
+        return -EINVAL;
+    }
+
+    if (copy_from_user(&(u->dimm), (struct v2d_ioctl_set_dimensions*)arg, sizeof(struct v2d_ioctl_set_dimensions))) {
+                return -EFAULT;
+    }
+    u->initialized = 1;
+
+    printk(KERN_NOTICE "initialized canvas to %u x %u", u->dimm.width, u->dimm.height);
+
     return 0;
 }
 
 static int v2d_mmap(struct file *f, struct vm_area_struct *vm_area) {
+    struct v2d_user *u;
+
+    u = f->private_data;
+    if (!u->initialized) {
+        printk(KERN_ERR V2D_UNINITIALIZED_ERR);
+        return -EINVAL;
+    }
     return 0;
 }
 
 static int v2d_fsync(struct file *f, loff_t a, loff_t b, int datasync) {
+    struct v2d_user *u;
+
+    u = f->private_data;
+    if (!u->initialized) {
+        printk(KERN_ERR V2D_UNINITIALIZED_ERR);
+        return -EINVAL;
+    }
     return 0;
 }
 
