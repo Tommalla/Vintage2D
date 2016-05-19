@@ -32,15 +32,32 @@ struct v2d_data {
     void __iomem *bar0;
 };
 
+struct v2d_user {
+    struct v2d_data *v2ddev;
+    // TODO context and whatnot
+};
+
 static irqreturn_t v2d_irq(int irq, void *dev) {
     return IRQ_HANDLED;
 }
 
 static int v2d_open(struct inode *i, struct file *f) {
+    printk(KERN_NOTICE "v2dopen...");
+    struct v2d_data *v2ddev;
+    struct v2d_user *u;
+
+    v2ddev = container_of(i->i_cdev, struct v2d_data, cdev);
+    u = kmalloc(sizeof(struct v2d_user), GFP_KERNEL);
+    if (!u)
+        return -ENOMEM;
+    u->v2ddev = v2ddev;
+    f->private_data = u;
     return 0;
 }
 
 static int v2d_release(struct inode *i, struct file *f) {
+    printk(KERN_NOTICE "v2drelease...");
+    kfree(f->private_data);
     return 0;
 }
 
