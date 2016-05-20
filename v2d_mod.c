@@ -14,6 +14,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/dmapool.h>
 #include <linux/spinlock.h>
+#include <linux/mm.h>
 
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
@@ -31,6 +32,12 @@ struct v2d_data {
     struct pci_dev *pdev;
     struct cdev cdev;
     void __iomem *bar0;
+    struct dma_pool *canvas_pool;
+};
+
+struct v2d_page {
+    void *vaddr;
+    dma_addr_t dma_addr;
 };
 
 struct v2d_user {
@@ -38,7 +45,9 @@ struct v2d_user {
     // Context data:
     int initialized;
     struct v2d_ioctl_set_dimensions dimm;
-    // TODO context and whatnot
+    struct mutex write_lock;
+    struct v2d_page *pages; // Canvas memory, page-by-page
+    int pages_num;
 };
 
 static irqreturn_t v2d_irq(int irq, void *dev) {
@@ -56,30 +65,30 @@ static int v2d_open(struct inode *i, struct file *f) {
         return -ENOMEM;
     u->v2ddev = v2ddev;
     u->initialized = 0;
+    u->pages_num = 0;
     f->private_data = u;
+    mutex_init(&u->write_lock);
     return 0;
 }
 
 static int v2d_release(struct inode *i, struct file *f) {
-    printk(KERN_NOTICE "v2drelease...");
-    kfree(f->private_data);
-    return 0;
-}
-
-static ssize_t v2d_read(struct file *f, char __user *buf, size_t size, loff_t *off) {
+    int j;
     struct v2d_user *u;
 
+    printk(KERN_NOTICE "v2drelease...");
     u = f->private_data;
-    if (!u->initialized) {
-        printk(KERN_ERR V2D_UNINITIALIZED_ERR);
-        return -EINVAL;
-    }
 
+    for (j = 0; j < u->pages_num; ++j) {
+        dma_pool_free(u->v2ddev->canvas_pool, u->pages[j].vaddr, u->pages[j].dma_addr);
+    }
+    kfree(u->pages);
+    kfree(u);
     return 0;
 }
 
 static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, loff_t *off) {
     struct v2d_user *u;
+    char *data;
 
     u = f->private_data;
     if (!u->initialized) {
@@ -87,11 +96,36 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
         return -EINVAL;
     }
 
-    return 0;
+    if (size % 4) { // Not divisible by 32 bits
+        printk(KERN_ERR "v2d: Wrong write size: %u", size);
+        return -EINVAL;
+    }
+
+    data = kmalloc(sizeof(char) * size, GFP_KERNEL);
+
+    mutex_lock(&u->write_lock);
+    if (copy_from_user(data, buf, size)) {
+        mutex_unlock(&u->write_lock);
+        return -EFAULT;
+    }
+
+    switch (data[size - 1]) {
+        case V2D_CMD_TYPE_SRC_POS:
+            break;
+
+        default:
+            printk(KERN_NOTICE "Command: %02X", data[size - 1]);
+    }
+    mutex_unlock(&u->write_lock);
+
+    kfree(data);
+
+    return size;
 }
 
 static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     struct v2d_user *u;
+    unsigned int size, i;
     u = f->private_data;
 
     if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
@@ -107,14 +141,22 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     if (copy_from_user(&(u->dimm), (struct v2d_ioctl_set_dimensions*)arg, sizeof(struct v2d_ioctl_set_dimensions))) {
                 return -EFAULT;
     }
+
+    size = u->dimm.width * u->dimm.height;
+    u->pages_num = size / VINTAGE2D_PAGE_SIZE + ((size % VINTAGE2D_PAGE_SIZE) > 0 ? 1 : 0);
+
+    u->pages = kmalloc(sizeof(struct v2d_page) * u->pages_num, GFP_KERNEL);
+    for (i = 0; i < u->pages_num; ++i) {
+        u->pages[i].vaddr = dma_pool_alloc(u->v2ddev->canvas_pool, GFP_KERNEL, &u->pages[i].dma_addr);
+    }
     u->initialized = 1;
 
-    printk(KERN_NOTICE "initialized canvas to %u x %u", u->dimm.width, u->dimm.height);
+    printk(KERN_NOTICE "v2d: initialized canvas to %u x %u", u->dimm.width, u->dimm.height);
 
     return 0;
 }
 
-static int v2d_mmap(struct file *f, struct vm_area_struct *vm_area) {
+static int v2d_mmap(struct file *f, struct vm_area_struct *vma) {
     struct v2d_user *u;
 
     u = f->private_data;
@@ -122,6 +164,14 @@ static int v2d_mmap(struct file *f, struct vm_area_struct *vm_area) {
         printk(KERN_ERR V2D_UNINITIALIZED_ERR);
         return -EINVAL;
     }
+
+    if (vma->vm_end - vma->vm_end > u->dimm.width * u->dimm.height) {
+        printk(KERN_ERR "v2d: Tried to map a canvas bigger than allocated.");
+        return -EINVAL;
+    }
+
+    // TODO map
+
     return 0;
 }
 
@@ -140,7 +190,6 @@ static struct file_operations v2d_fops = {
     .owner = THIS_MODULE,
     .open = v2d_open,
     .release = v2d_release,
-    .read = v2d_read,
     .write = v2d_write,
     .unlocked_ioctl = v2d_ioctl,
     .mmap = v2d_mmap,
@@ -185,6 +234,13 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
     if (IS_ERR_VALUE(rc))
         goto err_irq;
 
+    v2ddev->canvas_pool = dma_pool_create("v2ddev canvas", &v2ddev->pdev->dev,
+            VINTAGE2D_PAGE_SIZE, VINTAGE2D_PAGE_SIZE, 0);
+    if (!v2ddev->canvas_pool) {
+        rc = -ENOMEM;
+        goto err_canvas_pool;
+    }
+
     /* TODO: lock */
     minor = idr_alloc(&v2ddev_idr, v2ddev, 0, V2D_MAX_COUNT, GFP_KERNEL);
     if (IS_ERR_VALUE(minor)) {
@@ -209,6 +265,8 @@ err_dev:
 err_cdev:
     idr_remove(&v2ddev_idr, minor);
 err_idr:
+    dma_pool_destroy(v2ddev->canvas_pool);
+err_canvas_pool:
     free_irq(dev->irq, v2ddev);
 err_irq:
 err_dma_mask:
@@ -236,6 +294,7 @@ void v2d_remove(struct pci_dev *dev) {
     device_destroy(v2d_class, v2ddev->cdev.dev);
     cdev_del(&v2ddev->cdev);
     idr_remove(&v2ddev_idr, MINOR(v2ddev->cdev.dev));
+    dma_pool_destroy(v2ddev->canvas_pool);
     free_irq(dev->irq, v2ddev);
     pci_iounmap(dev, v2ddev->bar0);
     pci_release_regions(dev);

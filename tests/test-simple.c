@@ -14,11 +14,13 @@ int main(int argc, char **argv) {
     }
     printf("Initialized...\n");
     canvas = v2d_mmap(fd, 10, 10);
+    printf("mmap finished...\n");
     if (canvas == MAP_FAILED) {
         perror("mmap");
         exit(1);
     }
     memset(canvas, 0, 10*10);
+    printf("Writes...\n");
     v2d_write_single_checked(fd, V2D_CMD_DST_POS(0, 0), "V2D_CMD_DST_POS");
     v2d_write_single_checked(fd, V2D_CMD_FILL_COLOR(0xff), "V2D_CMD_FILL_COLOR");
     v2d_write_single_checked(fd, V2D_CMD_DO_FILL(5, 5), "V2D_CMD_DO_FILL");
