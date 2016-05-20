@@ -58,7 +58,7 @@ static int v2d_open(struct inode *i, struct file *f) {
     struct v2d_data *v2ddev;
     struct v2d_user *u;
 
-    printk(KERN_NOTICE "v2dopen...");
+    printk(KERN_NOTICE "v2dopen...\n");
     v2ddev = container_of(i->i_cdev, struct v2d_data, cdev);
     u = kmalloc(sizeof(struct v2d_user), GFP_KERNEL);
     if (!u)
@@ -75,7 +75,7 @@ static int v2d_release(struct inode *i, struct file *f) {
     int j;
     struct v2d_user *u;
 
-    printk(KERN_NOTICE "v2drelease...");
+    printk(KERN_NOTICE "v2drelease...\n");
     u = f->private_data;
 
     for (j = 0; j < u->pages_num; ++j) {
@@ -97,7 +97,7 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
     }
 
     if (size % 4) { // Not divisible by 32 bits
-        printk(KERN_ERR "v2d: Wrong write size: %u", size);
+        printk(KERN_ERR "v2d: Wrong write size: %u\n", size);
         return -EINVAL;
     }
 
@@ -114,7 +114,7 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
             break;
 
         default:
-            printk(KERN_NOTICE "Command: %02X", data[size - 1]);
+            printk(KERN_NOTICE "Command: %02X\n", data[size - 1]);
     }
     mutex_unlock(&u->write_lock);
 
@@ -129,12 +129,12 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     u = f->private_data;
 
     if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
-        printk(KERN_ERR "ioctl used for an unknown command: %u", cmd);
+        printk(KERN_ERR "ioctl used for an unknown command: %u\n", cmd);
         return -EINVAL;
     }
 
     if (u->initialized) {
-        printk(KERN_ERR "trying to set canvas dimensions for the second time");
+        printk(KERN_ERR "trying to set canvas dimensions for the second time\n");
         return -EINVAL;
     }
 
@@ -151,13 +151,20 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     }
     u->initialized = 1;
 
-    printk(KERN_NOTICE "v2d: initialized canvas to %u x %u", u->dimm.width, u->dimm.height);
+    printk(KERN_NOTICE "v2d: initialized canvas to %u x %u\n", u->dimm.width, u->dimm.height);
 
     return 0;
 }
 
 static int v2d_mmap(struct file *f, struct vm_area_struct *vma) {
     struct v2d_user *u;
+    unsigned long uaddr, usize;
+    int i;
+
+    uaddr = vma->vm_start;
+    usize = vma->vm_end - vma->vm_start;
+    // Potential FIXME (that might not align with PAGE_SIZE):
+    i = vma->vm_pgoff;
 
     u = f->private_data;
     if (!u->initialized) {
@@ -165,11 +172,27 @@ static int v2d_mmap(struct file *f, struct vm_area_struct *vma) {
         return -EINVAL;
     }
 
-    if (vma->vm_end - vma->vm_end > u->dimm.width * u->dimm.height) {
-        printk(KERN_ERR "v2d: Tried to map a canvas bigger than allocated.");
+    if (usize > u->pages_num * VINTAGE2D_PAGE_SIZE) {
+        printk(KERN_ERR "v2d: Tried to map a canvas bigger than allocated.\n");
         return -EINVAL;
     }
 
+    if (i >= u->pages_num) {
+        printk(KERN_ERR "v2d: (Possible drvier bug) tried to map a page id bigger than pages_num: %d\n", i);
+        return -EINVAL;
+    }
+
+    do {
+        int rc;
+        rc = vm_insert_page(vma, uaddr, virt_to_page(u->pages[i++].vaddr));
+        if (rc) {
+            printk(KERN_ERR "v2d: Remapping memory error: %d\n", rc);
+            return rc;
+        }
+
+        uaddr += VINTAGE2D_PAGE_SIZE;
+        usize -= VINTAGE2D_PAGE_SIZE;
+    } while (usize > 0);
     // TODO map
 
     return 0;
