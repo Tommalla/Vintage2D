@@ -20,9 +20,10 @@
 #include "v2d_ioctl.h"
 
 MODULE_LICENSE("GPL");
-#define V2D_UNINITIALIZED_ERR "Trying to use driver before initializing context with canvas size."
 
+#define V2D_UNINITIALIZED_ERR "Trying to use driver before initializing context with canvas size."
 #define V2D_MAX_COUNT 256
+#define V2D_MAX_DIMM 2048
 
 static struct class *v2d_class = NULL;
 dev_t dev_base = 0;
@@ -143,6 +144,11 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     }
 
     size = u->dimm.width * u->dimm.height;
+
+    if (size == 0 || u->dimm.width > V2D_MAX_DIMM || u->dimm.height > V2D_MAX_DIMM) {
+        return -EINVAL;
+    }
+
     u->pages_num = size / VINTAGE2D_PAGE_SIZE + ((size % VINTAGE2D_PAGE_SIZE) > 0 ? 1 : 0);
 
     u->pages = kmalloc(sizeof(struct v2d_page) * u->pages_num, GFP_KERNEL);
@@ -163,7 +169,7 @@ static int v2d_mmap(struct file *f, struct vm_area_struct *vma) {
 
     uaddr = vma->vm_start;
     usize = vma->vm_end - vma->vm_start;
-    // Potential FIXME (that might not align with PAGE_SIZE):
+    // NOTICE: Assumption: we're working on x86, so PAGE_SIZE = VINTAGE2D_PAGE_SIZE. Phew.
     i = vma->vm_pgoff;
 
     u = f->private_data;
