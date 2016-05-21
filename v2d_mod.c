@@ -19,11 +19,11 @@
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
 
-MODULE_LICENSE("GPL");
-
 #define V2D_UNINITIALIZED_ERR "Trying to use driver before initializing context with canvas size."
 #define V2D_MAX_COUNT 256
 #define V2D_MAX_DIMM 2048
+#define POS_UNSET (1 << 31)
+#define COLOR_UNSET 257
 
 static struct class *v2d_class = NULL;
 dev_t dev_base = 0;
@@ -34,6 +34,7 @@ struct v2d_data {
     struct cdev cdev;
     void __iomem *bar0;
     struct dma_pool *canvas_pool;
+    struct mutex dev_lock;
 };
 
 struct v2d_page {
@@ -49,6 +50,8 @@ struct v2d_user {
     struct mutex write_lock;
     struct v2d_page *pages; // Canvas memory, page-by-page
     int pages_num;
+    uint32_t src_pos, dst_pos;
+    uint16_t color;
 };
 
 static irqreturn_t v2d_irq(int irq, void *dev) {
@@ -67,6 +70,8 @@ static int v2d_open(struct inode *i, struct file *f) {
     u->v2ddev = v2ddev;
     u->initialized = 0;
     u->pages_num = 0;
+    u->src_pos = u->dst_pos = POS_UNSET;
+    u->color = COLOR_UNSET;
     f->private_data = u;
     mutex_init(&u->write_lock);
     return 0;
@@ -87,9 +92,77 @@ static int v2d_release(struct inode *i, struct file *f) {
     return 0;
 }
 
+static int enqueue(struct v2d_user *u, uint32_t cmd) {
+    /* TODO enqueue in a queue */
+    return 0;
+}
+
+/*
+ * Puts the command (and the SRC_POS/DST_POS commands before it) in the command queue.
+ * This method is safe - if there is no space on the queue, it will block until enqueueing
+ * is possible.
+ * Write lock must be held.
+ */
+static int enqueue_fill(struct v2d_user *u, uint32_t cmd) {
+    if (u->dst_pos == POS_UNSET || u->color == COLOR_UNSET) {
+        printk(KERN_ERR "v2d: Tried to FILL without DST_POS or COLOR.\n");
+        return -1;
+    }
+
+    /* TODO */
+    enqueue(u, cmd);
+
+    // FIXME unset?
+    return 0;
+}
+
+static int enqueue_blit(struct v2d_user *u, uint32_t cmd) {
+    if (u->src_pos == POS_UNSET || u->dst_pos == POS_UNSET) {
+        printk(KERN_ERR "v2d: Tried to BLIT without SRC_POS or DST_POS.\n");
+        return -1;
+    }
+
+    /* TODO */
+    enqueue(u, cmd);
+
+    return 0;
+}
+
+static int set_pos(struct v2d_user *u, uint32_t cmd, uint32_t *dst) {
+    uint32_t mask;
+    uint16_t x, y;
+
+    cmd >>= 8;   //remove cmd type
+
+    mask = 1 << 11;
+    if (cmd & mask) {
+        printk(KERN_ERR "v2d: pos has 19th bit on.");
+        return -EINVAL;
+    }
+
+    mask = 1 << 22;
+    if (cmd & mask) {
+        printk(KERN_ERR "v2d: pos has 31th bit on.");
+        return -EINVAL;
+    }
+
+    x = cmd % (1 << 11);
+    y = (cmd >> 12) % (1 << 11);
+
+    if (x > u->dimm.width || y > u->dimm.height) {
+        printk(KERN_ERR "v2d: tried to set pos outside canvas");
+        return -EINVAL;
+    }
+
+    *dst = cmd;
+
+    return 0;
+}
+
 static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, loff_t *off) {
     struct v2d_user *u;
-    char *data;
+    char *data, *ptr;
+    int rc;
 
     u = f->private_data;
     if (!u->initialized) {
@@ -110,18 +183,56 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
         return -EFAULT;
     }
 
-    switch (data[size - 1]) {
-        case V2D_CMD_TYPE_SRC_POS:
-            break;
+    rc = size;
 
-        default:
-            printk(KERN_NOTICE "Command: %02X\n", data[size - 1]);
+    for (ptr = data; ptr < data + size; ptr += 4) {
+        uint32_t cmd = *(uint32_t*)ptr;
+        uint8_t cmd_type = cmd % (1 << 8);
+        uint32_t c;
+        switch (cmd_type) {
+            case V2D_CMD_TYPE_SRC_POS:
+                if (set_pos(u, cmd, &u->src_pos)) {
+                    rc = -EINVAL;
+                }
+                break;
+
+            case V2D_CMD_TYPE_DST_POS:
+                if (set_pos(u, cmd, &u->dst_pos)) {
+                    rc = -EINVAL;
+                }
+                break;
+
+            case V2D_CMD_TYPE_FILL_COLOR:
+                c = cmd >> 8;
+                if (c >> 8) {
+                    printk(KERN_ERR "v2d: FILL_COLOR: 16-31th bits not 0.");
+                    rc = -EINVAL;
+                } else {
+                    u->color = (uint16_t)(c % (1 << 9));
+                }
+                break;
+
+            case V2D_CMD_TYPE_DO_BLIT:
+                if (enqueue_blit(u, cmd)) {
+                    rc = -EINVAL;
+                }
+                break;
+            case V2D_CMD_TYPE_DO_FILL:
+                if (enqueue_fill(u, cmd)) {
+                    rc = -EINVAL;
+                }
+                break;
+
+            default:
+                printk(KERN_ERR "v2d: Unknown command: %02X\n", cmd_type);
+                rc = -EINVAL;
+        }
     }
-    mutex_unlock(&u->write_lock);
 
+    mutex_unlock(&u->write_lock);
     kfree(data);
 
-    return size;
+    return rc;
 }
 
 static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
@@ -286,6 +397,7 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
     }
 
     pci_set_drvdata(dev, v2ddev);
+    mutex_init(&v2ddev->dev_lock);
     return 0;
 
     device_destroy(v2d_class, v2ddev->cdev.dev);
@@ -328,6 +440,7 @@ void v2d_remove(struct pci_dev *dev) {
     pci_iounmap(dev, v2ddev->bar0);
     pci_release_regions(dev);
     pci_disable_device(dev);
+
     kfree(v2ddev);
 }
 
@@ -377,3 +490,5 @@ static void v2d_cleanup(void) {
 
 module_init(v2d_init);
 module_exit(v2d_cleanup);
+
+MODULE_LICENSE("GPL");
