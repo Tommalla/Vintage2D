@@ -22,12 +22,22 @@
 #define V2D_UNINITIALIZED_ERR "Trying to use driver before initializing context with canvas size."
 #define V2D_MAX_COUNT 256
 #define V2D_MAX_DIMM 2048
-#define POS_UNSET (1 << 31)
-#define COLOR_UNSET 257
+#define V2D_POS_UNSET (1 << 31)
+#define V2D_COLOR_UNSET 257
+#define V2D_DEV_CMD_QUEUE_SIZE 256
 
 static struct class *v2d_class = NULL;
 dev_t dev_base = 0;
 static DEFINE_IDR(v2ddev_idr);
+
+struct v2d_cmd {
+    uint32_t cmd;
+    // TODO
+};
+
+struct v2d_cmd_meta {
+    struct v2d_user *u;
+};
 
 struct v2d_data {
     struct pci_dev *pdev;
@@ -35,6 +45,13 @@ struct v2d_data {
     void __iomem *bar0;
     struct dma_pool *canvas_pool;
     struct mutex dev_lock;
+
+    // Queue
+    dma_addr_t dev_cmd_queue;
+    uint32_t *virt_cmd_queue;
+    struct v2d_cmd_meta cmd_meta[V2D_DEV_CMD_QUEUE_SIZE];
+    int head, tail;
+    struct mutex queue_lock;
 };
 
 struct v2d_page {
@@ -70,8 +87,8 @@ static int v2d_open(struct inode *i, struct file *f) {
     u->v2ddev = v2ddev;
     u->initialized = 0;
     u->pages_num = 0;
-    u->src_pos = u->dst_pos = POS_UNSET;
-    u->color = COLOR_UNSET;
+    u->src_pos = u->dst_pos = V2D_POS_UNSET;
+    u->color = V2D_COLOR_UNSET;
     f->private_data = u;
     mutex_init(&u->write_lock);
     return 0;
@@ -104,7 +121,7 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
  * Write lock must be held.
  */
 static int enqueue_fill(struct v2d_user *u, uint32_t cmd) {
-    if (u->dst_pos == POS_UNSET || u->color == COLOR_UNSET) {
+    if (u->dst_pos == V2D_POS_UNSET || u->color == V2D_COLOR_UNSET) {
         printk(KERN_ERR "v2d: Tried to FILL without DST_POS or COLOR.\n");
         return -1;
     }
@@ -117,7 +134,7 @@ static int enqueue_fill(struct v2d_user *u, uint32_t cmd) {
 }
 
 static int enqueue_blit(struct v2d_user *u, uint32_t cmd) {
-    if (u->src_pos == POS_UNSET || u->dst_pos == POS_UNSET) {
+    if (u->src_pos == V2D_POS_UNSET || u->dst_pos == V2D_POS_UNSET) {
         printk(KERN_ERR "v2d: Tried to BLIT without SRC_POS or DST_POS.\n");
         return -1;
     }
@@ -129,25 +146,15 @@ static int enqueue_blit(struct v2d_user *u, uint32_t cmd) {
 }
 
 static int set_pos(struct v2d_user *u, uint32_t cmd, uint32_t *dst) {
-    uint32_t mask;
     uint16_t x, y;
 
-    cmd >>= 8;   //remove cmd type
+    x = V2D_CMD_POS_X(cmd);
+    y = V2D_CMD_POS_Y(cmd);
 
-    mask = 1 << 11;
-    if (cmd & mask) {
-        printk(KERN_ERR "v2d: pos has 19th bit on.");
+    if (V2D_CMD_SRC_POS(x, y) != cmd && V2D_CMD_DST_POS(x, y) != cmd) {
+        printk(KERN_ERR "v2d: corrupted POS_{SRC,DST}\n");
         return -EINVAL;
     }
-
-    mask = 1 << 22;
-    if (cmd & mask) {
-        printk(KERN_ERR "v2d: pos has 31th bit on.");
-        return -EINVAL;
-    }
-
-    x = cmd % (1 << 11);
-    y = (cmd >> 12) % (1 << 11);
 
     if (x > u->dimm.width || y > u->dimm.height) {
         printk(KERN_ERR "v2d: tried to set pos outside canvas");
@@ -155,7 +162,6 @@ static int set_pos(struct v2d_user *u, uint32_t cmd, uint32_t *dst) {
     }
 
     *dst = cmd;
-
     return 0;
 }
 
@@ -203,12 +209,12 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
                 break;
 
             case V2D_CMD_TYPE_FILL_COLOR:
-                c = cmd >> 8;
-                if (c >> 8) {
-                    printk(KERN_ERR "v2d: FILL_COLOR: 16-31th bits not 0.");
+                c = V2D_CMD_COLOR(cmd);
+                if (cmd != V2D_CMD_FILL_COLOR(c)) {
+                    printk(KERN_ERR "v2d: FILL_COLOR: 16-31th bits not 0.\n");
                     rc = -EINVAL;
                 } else {
-                    u->color = (uint16_t)(c % (1 << 9));
+                    u->color = c;
                 }
                 break;
 
@@ -310,7 +316,6 @@ static int v2d_mmap(struct file *f, struct vm_area_struct *vma) {
         uaddr += VINTAGE2D_PAGE_SIZE;
         usize -= VINTAGE2D_PAGE_SIZE;
     } while (usize > 0);
-    // TODO map
 
     return 0;
 }
@@ -335,6 +340,14 @@ static struct file_operations v2d_fops = {
     .mmap = v2d_mmap,
     .fsync = v2d_fsync,
 };
+
+static void set_read_ptr(struct v2d_data *v2ddev, dma_addr_t ptr) {
+    iowrite32(ptr, v2ddev->bar0 + VINTAGE2D_CMD_READ_PTR);
+}
+
+static void set_write_ptr(struct v2d_data *v2ddev, dma_addr_t ptr) {
+    iowrite32(ptr, v2ddev->bar0 + VINTAGE2D_CMD_WRITE_PTR);
+}
 
 static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
     struct v2d_data *v2ddev;
@@ -381,6 +394,13 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
         goto err_canvas_pool;
     }
 
+    v2ddev->virt_cmd_queue = dma_alloc_coherent(&v2ddev->pdev->dev, sizeof(uint32_t) * V2D_DEV_CMD_QUEUE_SIZE,
+                                                &v2ddev->dev_cmd_queue, GFP_KERNEL);
+    if (!v2ddev->virt_cmd_queue) {
+        rc = -ENOMEM;
+        goto err_dev_cmd_queue;
+    }
+
     /* TODO: lock */
     minor = idr_alloc(&v2ddev_idr, v2ddev, 0, V2D_MAX_COUNT, GFP_KERNEL);
     if (IS_ERR_VALUE(minor)) {
@@ -396,8 +416,15 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
         goto err_dev;
     }
 
-    pci_set_drvdata(dev, v2ddev);
     mutex_init(&v2ddev->dev_lock);
+    mutex_init(&v2ddev->queue_lock);
+    *(v2ddev->virt_cmd_queue + sizeof(uint32_t) * (V2D_DEV_CMD_QUEUE_SIZE - 1)) = (
+                VINTAGE2D_CMD_KIND_JUMP | ((v2ddev->dev_cmd_queue >> 2) << 2));
+    set_write_ptr(v2ddev, v2ddev->dev_cmd_queue);
+    set_read_ptr(v2ddev, v2ddev->dev_cmd_queue);
+    v2ddev->head = v2ddev->tail = 0;
+
+    pci_set_drvdata(dev, v2ddev);
     return 0;
 
     device_destroy(v2d_class, v2ddev->cdev.dev);
@@ -406,6 +433,9 @@ err_dev:
 err_cdev:
     idr_remove(&v2ddev_idr, minor);
 err_idr:
+    dma_free_coherent(&v2ddev->pdev->dev, sizeof(uint32_t) * V2D_DEV_CMD_QUEUE_SIZE, v2ddev->virt_cmd_queue,
+                      v2ddev->dev_cmd_queue);
+err_dev_cmd_queue:
     dma_pool_destroy(v2ddev->canvas_pool);
 err_canvas_pool:
     free_irq(dev->irq, v2ddev);
@@ -436,6 +466,8 @@ void v2d_remove(struct pci_dev *dev) {
     cdev_del(&v2ddev->cdev);
     idr_remove(&v2ddev_idr, MINOR(v2ddev->cdev.dev));
     dma_pool_destroy(v2ddev->canvas_pool);
+    dma_free_coherent(&v2ddev->pdev->dev, sizeof(uint32_t) * V2D_DEV_CMD_QUEUE_SIZE, v2ddev->virt_cmd_queue,
+                      v2ddev->dev_cmd_queue);
     free_irq(dev->irq, v2ddev);
     pci_iounmap(dev, v2ddev->bar0);
     pci_release_regions(dev);
