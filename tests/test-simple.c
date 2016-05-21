@@ -28,6 +28,7 @@ int main(int argc, char **argv) {
     v2d_write_single_checked(fd, V2D_CMD_DST_POS(5, 5), "V2D_CMD_DST_POS");
     v2d_write_single_checked(fd, V2D_CMD_DO_BLIT(5, 5), "V2D_CMD_DO_BLIT");
     fsync(fd);
+    sleep(2);
     v2d_print_canvas(canvas, 10, 10);
 
     return 0;
