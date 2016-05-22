@@ -56,6 +56,7 @@ struct v2d_data {
     struct v2d_cmd_meta meta_queue[V2D_CMD_QUEUE_SIZE]; // Last pos unused.
     uint32_t head, tail, space;
     struct mutex queue_lock;
+    wait_queue_head_t write_queue;
 };
 
 struct v2d_user {
@@ -97,6 +98,35 @@ static void reset(struct v2d_data *v2ddev, uint8_t reset_draw, uint8_t reset_fif
               (reset_tlb ? VINTAGE2D_RESET_TLB : 0), v2ddev->bar0 + VINTAGE2D_RESET);
 }
 
+/* Requires queue lock */
+static void update_space(struct v2d_data *v2ddev) {
+    if (v2ddev->tail >= v2ddev->head) {
+        v2ddev->space = V2D_CMD_QUEUE_SIZE - 1 - v2ddev->tail + v2ddev->head - 1;
+    } else {
+        v2ddev->space = V2D_CMD_QUEUE_SIZE - 1 - v2ddev->head + v2ddev->tail - 1;
+    }
+}
+
+/* Requires queue lock */
+static void incr_head(struct v2d_data *v2ddev) {
+    v2ddev->head++;
+    if (v2ddev->head >= V2D_CMD_QUEUE_SIZE - 1) {
+        v2ddev->head = 0;
+    }
+    update_space(v2ddev);
+    printk(KERN_NOTICE "v2d: Moved head to %u, space = %u\n", v2ddev->head, v2ddev->space);
+}
+
+/* Requires queue lock */
+static void incr_tail(struct v2d_data *v2ddev) {
+    v2ddev->tail++;
+    if (v2ddev->tail >= V2D_CMD_QUEUE_SIZE - 1) {  // Intentionally skipping the last index (JUMP)
+        v2ddev->tail = 0;
+    }
+    update_space(v2ddev);
+    printk(KERN_NOTICE "v2d: Moved tail to %u, space = %u\n", v2ddev->tail, v2ddev->space);
+}
+
 static irqreturn_t v2d_irq(int irq, void *dev) {
     struct v2d_data *v2ddev;
     uint32_t intr, counter, delta;
@@ -121,7 +151,9 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
             return IRQ_HANDLED; // 'GARBAGE' IRQ
         }
 
-        while (v2ddev->last_read_counter != counter && v2ddev->head != v2ddev->tail) {
+        printk(KERN_NOTICE "Read counter=%u, last_read_counter=%u\n", counter, v2ddev->last_read_counter);
+        // FIXME potential problem with garbage counter at the beginning?
+        while (v2ddev->last_read_counter != counter) {
             if (VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd) == VINTAGE2D_CMD_TYPE_COUNTER) {
                 struct v2d_user *u;
                 u = v2ddev->meta_queue[v2ddev->head].u;
@@ -133,10 +165,10 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
 
             printk(KERN_NOTICE "Finished cmd: id = %u type = %u\n", v2ddev->head, VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd));
 
-            v2ddev->head++;
-            if (v2ddev->head >= V2D_CMD_QUEUE_SIZE - 1) {
-                v2ddev->head = 0;
-            }
+            mutex_lock(&v2ddev->queue_lock);
+            incr_head(v2ddev);
+            mutex_unlock(&v2ddev->queue_lock);
+            wake_up(&v2ddev->write_queue);
         }
 
     } else {
@@ -188,26 +220,20 @@ static int v2d_release(struct inode *i, struct file *f) {
     return 0;
 }
 
+/*
+ * This function simply puts the command in all the releveant queues.
+ * Write mutex must be held.
+ */
 static void send_command(struct v2d_user *u, uint32_t cmd) {
     struct v2d_data *v2ddev;
 
     v2ddev = u->v2ddev;
-    // TODO
     // Put command in the queue.
     printk(KERN_NOTICE "Enqueueing: %u %u\n", v2ddev->tail, VINTAGE2D_CMD_TYPE(cmd));
     v2ddev->virt_cmd_queue[v2ddev->tail] = cmd;
     v2ddev->meta_queue[v2ddev->tail].u = u;
     v2ddev->meta_queue[v2ddev->tail].cmd = cmd;
-    v2ddev->tail++;
-    if (v2ddev->tail >= V2D_CMD_QUEUE_SIZE - 1) {  // Intentionally skipping the last index (JUMP)
-        v2ddev->tail = 0;
-    }
-    if (v2ddev->tail >= v2ddev->head) {
-        v2ddev->space = v2ddev->tail - v2ddev->head;
-    } else {
-        v2ddev->space = V2D_CMD_QUEUE_SIZE - 1 - v2ddev->head + v2ddev->tail;
-    }
-
+    incr_tail(v2ddev);
     set_write_ptr(u->v2ddev, u->v2ddev->dev_cmd_queue + v2ddev->tail * sizeof(uint32_t));
 
     print_dev_status(u->v2ddev);
@@ -226,7 +252,8 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
     uint32_t size;
     uint8_t context_change;
 
-    size = 1;
+    // FIXME move counter after write
+    size = 2;   // COUNTER
     context_change = u->v2ddev->last_user != u ? 1 : 0;
 
     if (context_change) {
@@ -238,7 +265,16 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
         size += 2; //DST_POS, SRC_POS / FILL_COLOR
     }
 
-    // // TODO hang on condition (size > avail)
+    mutex_lock(&u->v2ddev->queue_lock);
+
+    while (u->v2ddev->space < size) {
+        mutex_unlock(&u->v2ddev->queue_lock);
+        wait_event(u->v2ddev->write_queue, u->v2ddev->space >= size);
+        mutex_lock(&u->v2ddev->queue_lock);
+    }
+
+    printk(KERN_NOTICE "Before sending commands: size = %u, space = %u\n", size, u->v2ddev->space);
+
     // Temporarily commented out:
     if (context_change) {
         change_context(u);
@@ -262,8 +298,7 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
     u->wait_for_counter = u->v2ddev->counter;
     u->v2ddev->counter++;
 
-    // TODO
-    // FIXME mutexes and whatnot
+    mutex_unlock(&u->v2ddev->queue_lock);
     return 0;
 }
 
@@ -592,13 +627,16 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
 
     mutex_init(&v2ddev->dev_lock);
     mutex_init(&v2ddev->queue_lock);
+    init_waitqueue_head(&v2ddev->write_queue);
     v2ddev->virt_cmd_queue[V2D_CMD_QUEUE_SIZE - 1] = VINTAGE2D_CMD_KIND_JUMP | ((v2ddev->dev_cmd_queue >> 2) << 2);
     reset(v2ddev, 1, 1, 1);
     set_write_ptr(v2ddev, v2ddev->dev_cmd_queue);
     set_read_ptr(v2ddev, v2ddev->dev_cmd_queue);
     v2ddev->head = v2ddev->tail = 0;
+    v2ddev->space = V2D_CMD_QUEUE_SIZE - 2; // -JUMP and one free addr so as not to stop the dev from reading.
     v2ddev->last_user = NULL;
-    v2ddev->counter = v2ddev->last_counter_sync = 0;
+    v2ddev->counter = 1;
+    v2ddev->last_counter_sync = 0;
     v2ddev->last_read_counter = 0;
 
     pci_set_drvdata(dev, v2ddev);
