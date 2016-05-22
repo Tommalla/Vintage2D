@@ -83,12 +83,21 @@ static void set_write_ptr(struct v2d_data *v2ddev, dma_addr_t ptr) {
 }
 
 static void print_dev_status(struct v2d_data *v2ddev) {
-    printk(KERN_NOTICE "READ = %08X, WRITE = %08X, INTR = %u\n", ioread32(v2ddev->bar0 + VINTAGE2D_CMD_READ_PTR),
-                                                                 ioread32(v2ddev->bar0 + VINTAGE2D_CMD_WRITE_PTR),
-                                                                 ioread32(v2ddev->bar0 + VINTAGE2D_STATUS));
+    printk(KERN_NOTICE "READ = %08X, WRITE = %08X, INTR = %u, STATUS = %u, ENABLE = %u,  FIFO_FREE = %u, PTE ?= %08X\n",
+           ioread32(v2ddev->bar0 + VINTAGE2D_CMD_READ_PTR), ioread32(v2ddev->bar0 + VINTAGE2D_CMD_WRITE_PTR),
+           ioread32(v2ddev->bar0 + VINTAGE2D_INTR), ioread32(v2ddev->bar0 + VINTAGE2D_STATUS),
+           ioread32(v2ddev->bar0 + VINTAGE2D_ENABLE),
+           ioread32(v2ddev->bar0 + VINTAGE2D_FIFO_FREE), ioread32(v2ddev->bar0 + VINTAGE2D_DST_TLB_PTE));
+    iowrite32(31, v2ddev->bar0 + VINTAGE2D_INTR);
+}
+
+static void reset(struct v2d_data *v2ddev, uint8_t reset_draw, uint8_t reset_fifo, uint8_t reset_tlb) {
+    iowrite32((reset_draw ? VINTAGE2D_RESET_DRAW : 0) | (reset_fifo ? VINTAGE2D_RESET_FIFO : 0) |
+              (reset_tlb ? VINTAGE2D_RESET_TLB : 0), v2ddev->bar0 + VINTAGE2D_RESET);
 }
 
 static irqreturn_t v2d_irq(int irq, void *dev) {
+    // printk(KERN_ERR "v2d: IRQ: %08X\n", irq);
     return IRQ_HANDLED;
 }
 
@@ -121,7 +130,7 @@ static int v2d_release(struct inode *i, struct file *f) {
     for (j = 0; j < u->pages_num; ++j) {
         dma_pool_free(u->v2ddev->canvas_pool, u->vpages[j], u->dpages[j]);
     }
-    dma_free_coherent(&u->v2ddev->pdev->dev, u->pages_num * sizeof(dma_addr_t), u->vpt, u->dpt);
+    dma_free_coherent(&u->v2ddev->pdev->dev, (u->pages_num + ((1 << 10) - (u->pages_num % (1 << 10)))) * sizeof(uint32_t), u->vpt, u->dpt);
     kfree(u->vpages);
     kfree(u->dpages);
     kfree(u);
@@ -147,12 +156,15 @@ static void send_command(struct v2d_user *u, uint32_t cmd) {
     }
 
     set_write_ptr(u->v2ddev, u->v2ddev->dev_cmd_queue + v2ddev->tail * sizeof(uint32_t));
+
     print_dev_status(u->v2ddev);
 }
 
 static void change_context(struct v2d_user *u) {
-    send_command(u, VINTAGE2D_CMD_CANVAS_PT((uint32_t)u->dpt, 0));
+    printk(KERN_NOTICE "Canvas change, v2d: PT = %08X\n", u->dpt);
+    //reset(u->v2ddev, 0, 0, 1);
     send_command(u, VINTAGE2D_CMD_CANVAS_DIMS(u->dimm.width, u->dimm.height, 0));
+    send_command(u, VINTAGE2D_CMD_CANVAS_PT((uint32_t)u->dpt, 0));
 }
 
 static int enqueue(struct v2d_user *u, uint32_t cmd) {
@@ -208,7 +220,7 @@ static int enqueue_fill(struct v2d_user *u, uint32_t cmd) {
         return -1;
     }
 
-    /* TODO */
+    /* TODO check validity */
     enqueue(u, cmd);
 
     // FIXME unset?
@@ -221,7 +233,7 @@ static int enqueue_blit(struct v2d_user *u, uint32_t cmd) {
         return -1;
     }
 
-    /* TODO */
+    /* TODO check validity */
     enqueue(u, cmd);
 
     return 0;
@@ -273,6 +285,8 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
     }
 
     rc = size;
+
+    print_dev_status(u->v2ddev);
 
     for (ptr = data; ptr < data + size; ptr += 4) {
         uint32_t cmd = *(uint32_t*)ptr;
@@ -355,11 +369,12 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
     u->vpages = kmalloc(sizeof(void *) * u->pages_num, GFP_KERNEL);
     u->dpages = kmalloc(sizeof(dma_addr_t) * u->pages_num, GFP_KERNEL);
-    u->vpt = dma_alloc_coherent(&u->v2ddev->pdev->dev, u->pages_num * sizeof(dma_addr_t), &u->dpt, GFP_KERNEL);
-    // On 32-bit machines dma_addr_t is u32, so we're ok with this size (aligned to Vintage2D's requirements).
+    u->vpt = dma_alloc_coherent(&u->v2ddev->pdev->dev, u->pages_num * sizeof(uint32_t), &u->dpt, GFP_KERNEL);
     for (i = 0; i < u->pages_num; ++i) {
         u->vpages[i] = dma_pool_alloc(u->v2ddev->canvas_pool, GFP_KERNEL, &u->dpages[i]);
-        *(u->vpt + i * sizeof(dma_addr_t)) = u->dpages[i];
+        *(u->vpt + i * sizeof(uint32_t)) = (
+                ((u->dpages[i] >> VINTAGE2D_PAGE_SHIFT) << VINTAGE2D_PAGE_SHIFT) | VINTAGE2D_PTE_VALID);
+        printk(KERN_NOTICE "v2d: Page = %08X, orig = %08X\n", *(u->vpt + i * sizeof(uint32_t)), u->dpages[i]);
     }
     u->initialized = 1;
 
@@ -436,6 +451,8 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
     int rc;
     struct device *device;
 
+    printk(KERN_NOTICE "v2d_probe...\n");
+
     v2ddev = kmalloc(sizeof(struct v2d_data), GFP_KERNEL);
     if (!v2ddev) {
         return -ENOMEM;
@@ -465,8 +482,9 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
     }
 
     rc = request_irq(dev->irq, v2d_irq, IRQF_SHARED, "v2ddev", v2ddev);
-    if (IS_ERR_VALUE(rc))
+    if (IS_ERR_VALUE(rc)) {
         goto err_irq;
+    }
 
     v2ddev->canvas_pool = dma_pool_create("v2ddev canvas", &v2ddev->pdev->dev,
             VINTAGE2D_PAGE_SIZE, VINTAGE2D_PAGE_SIZE, 0);
@@ -508,7 +526,8 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
 
     pci_set_drvdata(dev, v2ddev);
 
-    iowrite32(VINTAGE2D_ENABLE_DRAW | VINTAGE2D_ENABLE_FETCH_CMD, v2ddev->bar0 + VINTAGE2D_ENABLE);
+    iowrite32(VINTAGE2D_ENABLE_FETCH_CMD | VINTAGE2D_ENABLE_DRAW, v2ddev->bar0 + VINTAGE2D_ENABLE);
+    iowrite32(0, v2ddev->bar0 + VINTAGE2D_INTR_ENABLE);
     return 0;
 
     device_destroy(v2d_class, v2ddev->cdev.dev);
@@ -533,11 +552,6 @@ err_pci_region:
 err_pci_enable:
     kfree(v2ddev);
     return rc;
-}
-
-static void reset(struct v2d_data *v2ddev, uint8_t reset_draw, uint8_t reset_fifo, uint8_t reset_tlb) {
-    iowrite32((reset_draw ? VINTAGE2D_RESET_DRAW : 0) | (reset_fifo ? VINTAGE2D_RESET_FIFO : 0) |
-              (reset_tlb ? VINTAGE2D_RESET_TLB : 0), v2ddev->bar0 + VINTAGE2D_RESET);
 }
 
 static void v2d_remove(struct pci_dev *dev) {
