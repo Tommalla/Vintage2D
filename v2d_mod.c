@@ -25,6 +25,7 @@
 #define V2D_POS_UNSET (1 << 31)
 #define V2D_COLOR_UNSET 257
 #define V2D_CMD_QUEUE_SIZE 256
+#define V2D_COUNTER_MOD (1 << 24)
 
 static struct class *v2d_class = NULL;
 dev_t dev_base = 0;
@@ -46,7 +47,8 @@ struct v2d_data {
     struct dma_pool *canvas_pool;
     struct mutex dev_lock;
     struct v2d_user *last_user;
-    uint32_t counter, last_read_counter;
+    uint64_t counter, last_counter_sync;
+    uint32_t last_read_counter;
 
     // Queue
     dma_addr_t dev_cmd_queue;
@@ -69,7 +71,7 @@ struct v2d_user {
     int pages_num;
     struct v2d_pos src_pos, dst_pos;
     uint16_t color;
-    uint32_t last_counter;
+    uint64_t wait_for_counter;
     wait_queue_head_t fsync_queue;
 };
 
@@ -97,7 +99,7 @@ static void reset(struct v2d_data *v2ddev, uint8_t reset_draw, uint8_t reset_fif
 
 static irqreturn_t v2d_irq(int irq, void *dev) {
     struct v2d_data *v2ddev;
-    uint32_t intr, counter;
+    uint32_t intr, counter, delta;
 
     v2ddev = dev;
 
@@ -112,29 +114,31 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
 
     if (intr & VINTAGE2D_INTR_NOTIFY) {
         counter = ioread32(v2ddev->bar0 + VINTAGE2D_COUNTER);
+        delta = counter - v2ddev->last_read_counter;
+        v2ddev->last_counter_sync += delta;
+
         if (counter > v2ddev->counter) {
-            return IRQ_HANDLED; // In we're handling IRQ
+            return IRQ_HANDLED; // 'GARBAGE' IRQ
         }
-        while (counter > v2ddev->last_read_counter && v2ddev->head != v2ddev->tail) {
-            printk(KERN_ERR "counter=%d, last_read = %d\n", counter, v2ddev->last_read_counter);
+
+        while (v2ddev->last_read_counter != counter && v2ddev->head != v2ddev->tail) {
             if (VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd) == VINTAGE2D_CMD_TYPE_COUNTER) {
                 struct v2d_user *u;
                 u = v2ddev->meta_queue[v2ddev->head].u;
                 v2ddev->last_read_counter = VINTAGE2D_CMD_COUNTER_VALUE(v2ddev->meta_queue[v2ddev->head].cmd);
-                printk(KERN_NOTICE "counter=%d %d %d\n", VINTAGE2D_CMD_COUNTER_VALUE(v2ddev->meta_queue[v2ddev->head].cmd), counter, u->last_counter);
-                if (u->last_counter && v2ddev->last_read_counter >= u->last_counter) {
-                    u->last_counter = 0;
-                    wake_up(&v2ddev->meta_queue[v2ddev->head].u->fsync_queue);
-                }
+                printk(KERN_NOTICE "counter=%d %d %llu\n",
+                       VINTAGE2D_CMD_COUNTER_VALUE(v2ddev->meta_queue[v2ddev->head].cmd), counter, u->wait_for_counter);
+                wake_up(&u->fsync_queue);
             }
 
-            printk(KERN_NOTICE "Finished cmd: %d %08X %u\n", v2ddev->head, v2ddev->meta_queue[v2ddev->head].u, VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd));
+            printk(KERN_NOTICE "Finished cmd: id = %u type = %u\n", v2ddev->head, VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd));
 
             v2ddev->head++;
             if (v2ddev->head >= V2D_CMD_QUEUE_SIZE - 1) {
                 v2ddev->head = 0;
             }
         }
+
     } else {
         printk(KERN_ERR "v2d irq: INTR = %d\n", intr);
     }
@@ -158,7 +162,7 @@ static int v2d_open(struct inode *i, struct file *f) {
     u->pages_num = 0;
     u->src_pos.x = u->src_pos.y = u->dst_pos.x = u->dst_pos.y = V2D_POS_UNSET;
     u->color = V2D_COLOR_UNSET;
-    u->last_counter = 0;
+    u->wait_for_counter = 0;
     f->private_data = u;
     mutex_init(&u->write_lock);
     init_waitqueue_head(&u->fsync_queue);
@@ -190,7 +194,7 @@ static void send_command(struct v2d_user *u, uint32_t cmd) {
     v2ddev = u->v2ddev;
     // TODO
     // Put command in the queue.
-    printk(KERN_NOTICE "Enqueueing: %d %08X %u\n", v2ddev->tail, u, VINTAGE2D_CMD_TYPE(cmd));
+    printk(KERN_NOTICE "Enqueueing: %u %u\n", v2ddev->tail, VINTAGE2D_CMD_TYPE(cmd));
     v2ddev->virt_cmd_queue[v2ddev->tail] = cmd;
     v2ddev->meta_queue[v2ddev->tail].u = u;
     v2ddev->meta_queue[v2ddev->tail].cmd = cmd;
@@ -209,12 +213,14 @@ static void send_command(struct v2d_user *u, uint32_t cmd) {
     print_dev_status(u->v2ddev);
 }
 
+/* Write mutex must be held */
 static void change_context(struct v2d_user *u) {
     printk(KERN_NOTICE "Canvas change, v2d: PT = %08X %u x %u\n", u->dpt, u->dimm.width, u->dimm.height);
     send_command(u, VINTAGE2D_CMD_CANVAS_PT((uint32_t)u->dpt, 0));
     send_command(u, VINTAGE2D_CMD_CANVAS_DIMS(u->dimm.width, u->dimm.height, 0));
 }
 
+/* Write mutex must be held */
 static int enqueue(struct v2d_user *u, uint32_t cmd) {
     /* TODO enqueue in a queue */
     uint32_t size;
@@ -251,9 +257,9 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
             break;
     }
 
-    printk(KERN_NOTICE "Sending counter = %d\n", u->v2ddev->counter);
-    send_command(u, VINTAGE2D_CMD_COUNTER(u->v2ddev->counter, 1));
-    u->last_counter = u->v2ddev->counter;
+    printk(KERN_NOTICE "Sending counter = %llu\n", u->v2ddev->counter);
+    send_command(u, VINTAGE2D_CMD_COUNTER(u->v2ddev->counter % V2D_COUNTER_MOD, 1));
+    u->wait_for_counter = u->v2ddev->counter;
     u->v2ddev->counter++;
 
     // TODO
@@ -483,6 +489,7 @@ static int v2d_mmap(struct file *f, struct vm_area_struct *vma) {
 
 static int v2d_fsync(struct file *f, loff_t a, loff_t b, int datasync) {
     struct v2d_user *u;
+    uint64_t wait_for_counter_copy;
 
     u = f->private_data;
     if (!u->initialized) {
@@ -491,9 +498,10 @@ static int v2d_fsync(struct file *f, loff_t a, loff_t b, int datasync) {
     }
 
     mutex_lock(&u->write_lock);
-    while (u->last_counter != 0) {
+    wait_for_counter_copy = u->wait_for_counter;
+    while (wait_for_counter_copy > u->v2ddev->last_counter_sync) {
         mutex_unlock(&u->write_lock);
-        wait_event(u->fsync_queue, u->last_counter == 0);
+        wait_event(u->fsync_queue, wait_for_counter_copy <= u->v2ddev->last_counter_sync);
         mutex_lock(&u->write_lock);
     }
 
@@ -590,7 +598,7 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
     set_read_ptr(v2ddev, v2ddev->dev_cmd_queue);
     v2ddev->head = v2ddev->tail = 0;
     v2ddev->last_user = NULL;
-    v2ddev->counter = 1;
+    v2ddev->counter = v2ddev->last_counter_sync = 0;
     v2ddev->last_read_counter = 0;
 
     pci_set_drvdata(dev, v2ddev);
