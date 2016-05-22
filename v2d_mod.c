@@ -34,11 +34,6 @@ struct v2d_pos {
     uint32_t x, y;
 };
 
-struct v2d_cmd {
-    uint32_t cmd;
-    // TODO
-};
-
 struct v2d_cmd_meta {
     struct v2d_user *u;
     uint32_t cmd;
@@ -87,11 +82,11 @@ static void set_write_ptr(struct v2d_data *v2ddev, dma_addr_t ptr) {
 }
 
 static void print_dev_status(struct v2d_data *v2ddev) {
-    printk(KERN_NOTICE "READ = %08X, WRITE = %08X, INTR = %u, STATUS = %u, ENABLE = %u,  FIFO_FREE = %u, PTE ?= %08X\n",
+    printk(KERN_NOTICE "READ = %08X, WRITE = %08X, INTR = %u, STATUS = %u, ENABLE = %u,  FIFO_FREE = %u\n",
            ioread32(v2ddev->bar0 + VINTAGE2D_CMD_READ_PTR), ioread32(v2ddev->bar0 + VINTAGE2D_CMD_WRITE_PTR),
            ioread32(v2ddev->bar0 + VINTAGE2D_INTR), ioread32(v2ddev->bar0 + VINTAGE2D_STATUS),
            ioread32(v2ddev->bar0 + VINTAGE2D_ENABLE),
-           ioread32(v2ddev->bar0 + VINTAGE2D_FIFO_FREE), ioread32(v2ddev->bar0 + VINTAGE2D_DST_TLB_PTE));
+           ioread32(v2ddev->bar0 + VINTAGE2D_FIFO_FREE));
     iowrite32(31, v2ddev->bar0 + VINTAGE2D_INTR);
 }
 
@@ -118,8 +113,7 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
     if (intr & VINTAGE2D_INTR_NOTIFY) {
         counter = ioread32(v2ddev->bar0 + VINTAGE2D_COUNTER);
         if (counter > v2ddev->counter) {
-            printk(KERN_NOTICE "Counter uninitialized... %d > %d\n", counter, v2ddev->counter);
-            return IRQ_HANDLED;
+            return IRQ_HANDLED; // In we're handling IRQ
         }
         while (counter > v2ddev->last_read_counter && v2ddev->head != v2ddev->tail) {
             printk(KERN_ERR "counter=%d, last_read = %d\n", counter, v2ddev->last_read_counter);
@@ -145,7 +139,7 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
         printk(KERN_ERR "v2d irq: INTR = %d\n", intr);
     }
 
-    printk(KERN_NOTICE "Handled INTR_ENABLE = %u.\n", ioread32(v2ddev->bar0 + VINTAGE2D_INTR_ENABLE));
+    printk(KERN_NOTICE "Handled.\n");
 
     return IRQ_HANDLED;
 }
@@ -587,8 +581,7 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
 
     mutex_init(&v2ddev->dev_lock);
     mutex_init(&v2ddev->queue_lock);
-    // *(v2ddev->virt_cmd_queue + sizeof(uint32_t) * (V2D_CMD_QUEUE_SIZE - 1)) = (
-    //             VINTAGE2D_CMD_KIND_JUMP | ((v2ddev->dev_cmd_queue >> 2) << 2));
+    v2ddev->virt_cmd_queue[V2D_CMD_QUEUE_SIZE - 1] = VINTAGE2D_CMD_KIND_JUMP | ((v2ddev->dev_cmd_queue >> 2) << 2);
     reset(v2ddev, 1, 1, 1);
     set_write_ptr(v2ddev, v2ddev->dev_cmd_queue);
     set_read_ptr(v2ddev, v2ddev->dev_cmd_queue);
