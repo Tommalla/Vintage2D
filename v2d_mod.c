@@ -172,10 +172,12 @@ static int v2d_release(struct inode *i, struct file *f) {
     printk(KERN_NOTICE "v2drelease...\n");
     u = f->private_data;
 
+    // TODO FIXME disable queue (disable fetch and re-enable in open?)
+
     for (j = 0; j < u->pages_num; ++j) {
         dma_pool_free(u->v2ddev->canvas_pool, u->vpages[j], u->dpages[j]);
     }
-    dma_free_coherent(&u->v2ddev->pdev->dev, u->pages_num * sizeof(uint32_t), u->vpt, u->dpt);
+    dma_pool_free(u->v2ddev->canvas_pool, u->vpt, u->dpt);
     kfree(u->vpages);
     kfree(u->dpages);
     kfree(u);
@@ -424,7 +426,8 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
     u->vpages = kmalloc(sizeof(void *) * u->pages_num, GFP_KERNEL);
     u->dpages = kmalloc(sizeof(dma_addr_t) * u->pages_num, GFP_KERNEL);
-    u->vpt = dma_alloc_coherent(&u->v2ddev->pdev->dev, u->pages_num * sizeof(uint32_t), &u->dpt, GFP_KERNEL);
+    u->vpt = dma_pool_alloc(u->v2ddev->canvas_pool, GFP_KERNEL, &u->dpt);   // There will never be more than 1024 pages,
+                                                                            // so a page is enough and well-aligned.
     for (i = 0; i < u->pages_num; ++i) {
         u->vpages[i] = dma_pool_alloc(u->v2ddev->canvas_pool, GFP_KERNEL, &u->dpages[i]);
         u->vpt[i] = ((u->dpages[i] >> VINTAGE2D_PAGE_SHIFT) << VINTAGE2D_PAGE_SHIFT) | VINTAGE2D_PTE_VALID;
