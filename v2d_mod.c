@@ -137,7 +137,7 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
             printk(KERN_NOTICE "Finished cmd: %d %08X %u\n", v2ddev->head, v2ddev->meta_queue[v2ddev->head].u, VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd));
 
             v2ddev->head++;
-            if (v2ddev->head >= V2D_CMD_QUEUE_SIZE) {
+            if (v2ddev->head >= V2D_CMD_QUEUE_SIZE - 1) {
                 v2ddev->head = 0;
             }
         }
@@ -181,7 +181,7 @@ static int v2d_release(struct inode *i, struct file *f) {
     for (j = 0; j < u->pages_num; ++j) {
         dma_pool_free(u->v2ddev->canvas_pool, u->vpages[j], u->dpages[j]);
     }
-    dma_free_coherent(&u->v2ddev->pdev->dev, (u->pages_num + ((1 << 10) - (u->pages_num % (1 << 10)))) * sizeof(uint32_t), u->vpt, u->dpt);
+    dma_free_coherent(&u->v2ddev->pdev->dev, u->pages_num * sizeof(uint32_t), u->vpt, u->dpt);
     kfree(u->vpages);
     kfree(u->dpages);
     kfree(u);
@@ -195,11 +195,11 @@ static void send_command(struct v2d_user *u, uint32_t cmd) {
     // TODO
     // Put command in the queue.
     printk(KERN_NOTICE "Enqueueing: %d %08X %u\n", v2ddev->tail, u, VINTAGE2D_CMD_TYPE(cmd));
-    *(v2ddev->virt_cmd_queue + v2ddev->tail * sizeof(uint32_t)) = cmd;
+    v2ddev->virt_cmd_queue[v2ddev->tail] = cmd;
     v2ddev->meta_queue[v2ddev->tail].u = u;
     v2ddev->meta_queue[v2ddev->tail].cmd = cmd;
     v2ddev->tail++;
-    if (v2ddev->tail >= V2D_CMD_QUEUE_SIZE) {  // Intentionally skipping the last index (JUMP)
+    if (v2ddev->tail >= V2D_CMD_QUEUE_SIZE - 1) {  // Intentionally skipping the last index (JUMP)
         v2ddev->tail = 0;
     }
     if (v2ddev->tail >= v2ddev->head) {
@@ -238,30 +238,27 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
 
     // // TODO hang on condition (size > avail)
     // Temporarily commented out:
-    // if (context_change) {
-    //     change_context(u);
-    // }
+    if (context_change) {
+        change_context(u);
+    }
 
-    // switch (VINTAGE2D_CMD_TYPE(cmd)) {
-    //     case VINTAGE2D_CMD_TYPE_DO_FILL:
-    //         send_command(u, VINTAGE2D_CMD_DST_POS(u->dst_pos.x, u->dst_pos.y, 0));
-    //         send_command(u, VINTAGE2D_CMD_FILL_COLOR(u->color, 0));
-    //         send_command(u, VINTAGE2D_CMD_DO_FILL(VINTAGE2D_CMD_WIDTH(cmd), VINTAGE2D_CMD_HEIGHT(cmd), 0));
-    //         break;
-    //     case VINTAGE2D_CMD_TYPE_DO_BLIT:
-    //         send_command(u, VINTAGE2D_CMD_DST_POS(u->dst_pos.x, u->dst_pos.y, 0));
-    //         send_command(u, VINTAGE2D_CMD_SRC_POS(u->src_pos.x, u->src_pos.y, 0));
-    //         send_command(u, VINTAGE2D_CMD_DO_BLIT(VINTAGE2D_CMD_WIDTH(cmd), VINTAGE2D_CMD_HEIGHT(cmd), 0));
-    //         break;
-    // }
+    switch (VINTAGE2D_CMD_TYPE(cmd)) {
+        case VINTAGE2D_CMD_TYPE_DO_FILL:
+            send_command(u, VINTAGE2D_CMD_DST_POS(u->dst_pos.x, u->dst_pos.y, 0));
+            send_command(u, VINTAGE2D_CMD_FILL_COLOR(u->color, 0));
+            send_command(u, VINTAGE2D_CMD_DO_FILL(VINTAGE2D_CMD_WIDTH(cmd), VINTAGE2D_CMD_HEIGHT(cmd), 0));
+            break;
+        case VINTAGE2D_CMD_TYPE_DO_BLIT:
+            send_command(u, VINTAGE2D_CMD_DST_POS(u->dst_pos.x, u->dst_pos.y, 0));
+            send_command(u, VINTAGE2D_CMD_SRC_POS(u->src_pos.x, u->src_pos.y, 0));
+            send_command(u, VINTAGE2D_CMD_DO_BLIT(VINTAGE2D_CMD_WIDTH(cmd), VINTAGE2D_CMD_HEIGHT(cmd), 0));
+            break;
+    }
 
     printk(KERN_NOTICE "Sending counter = %d\n", u->v2ddev->counter);
     send_command(u, VINTAGE2D_CMD_COUNTER(u->v2ddev->counter, 1));
-    send_command(u, VINTAGE2D_CMD_COUNTER(42, 1));
-    send_command(u, VINTAGE2D_CMD_COUNTER(43, 1));
-    send_command(u, VINTAGE2D_CMD_COUNTER(2, 1));
     u->last_counter = u->v2ddev->counter;
-    u->v2ddev->counter += 50;
+    u->v2ddev->counter++;
 
     // TODO
     // FIXME mutexes and whatnot
@@ -436,9 +433,8 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     u->vpt = dma_alloc_coherent(&u->v2ddev->pdev->dev, u->pages_num * sizeof(uint32_t), &u->dpt, GFP_KERNEL);
     for (i = 0; i < u->pages_num; ++i) {
         u->vpages[i] = dma_pool_alloc(u->v2ddev->canvas_pool, GFP_KERNEL, &u->dpages[i]);
-        *(u->vpt + i * sizeof(uint32_t)) = (
-                ((u->dpages[i] >> VINTAGE2D_PAGE_SHIFT) << VINTAGE2D_PAGE_SHIFT) | VINTAGE2D_PTE_VALID);
-        printk(KERN_NOTICE "v2d: Page = %08X, orig = %08X\n", *(u->vpt + i * sizeof(uint32_t)), u->dpages[i]);
+        u->vpt[i] = ((u->dpages[i] >> VINTAGE2D_PAGE_SHIFT) << VINTAGE2D_PAGE_SHIFT) | VINTAGE2D_PTE_VALID;
+        printk(KERN_NOTICE "v2d: Page = %08X, orig = %08X\n", u->vpt[i], u->dpages[i]);
     }
     u->initialized = 1;
 
