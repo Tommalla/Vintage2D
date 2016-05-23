@@ -22,7 +22,7 @@
 #define V2D_UNINITIALIZED_ERR "Trying to use driver before initializing context with canvas size."
 #define V2D_MAX_COUNT 256
 #define V2D_MAX_DIMM 2048
-#define V2D_POS_UNSET (1 << 31)
+#define V2D_COORD_UNSET (1 << 31)
 #define V2D_COLOR_UNSET 257
 #define V2D_CMD_QUEUE_SIZE 256
 #define V2D_COUNTER_MOD (1 << 24)
@@ -82,6 +82,11 @@ static void set_read_ptr(struct v2d_data *v2ddev, dma_addr_t ptr) {
 
 static void set_write_ptr(struct v2d_data *v2ddev, dma_addr_t ptr) {
     iowrite32(ptr, v2ddev->bar0 + VINTAGE2D_CMD_WRITE_PTR);
+}
+
+static void reset_draw_params(struct v2d_user *u) {
+    u->src_pos.x = u->src_pos.y = u->dst_pos.x = u->dst_pos.y = V2D_COORD_UNSET;
+    u->color = V2D_COLOR_UNSET;
 }
 
 static void print_dev_status(struct v2d_data *v2ddev) {
@@ -192,8 +197,7 @@ static int v2d_open(struct inode *i, struct file *f) {
     u->v2ddev = v2ddev;
     u->initialized = 0;
     u->pages_num = 0;
-    u->src_pos.x = u->src_pos.y = u->dst_pos.x = u->dst_pos.y = V2D_POS_UNSET;
-    u->color = V2D_COLOR_UNSET;
+    reset_draw_params(u);
     u->wait_for_counter = 0;
     f->private_data = u;
     mutex_init(&u->write_lock);
@@ -309,7 +313,7 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
  * Write lock must be held.
  */
 static int enqueue_fill(struct v2d_user *u, uint32_t cmd) {
-    if (u->dst_pos.x == V2D_POS_UNSET || u->color == V2D_COLOR_UNSET) {
+    if (u->dst_pos.x == V2D_COORD_UNSET || u->color == V2D_COLOR_UNSET) {
         printk(KERN_ERR "v2d: Tried to FILL without DST_POS or COLOR.\n");
         return -1;
     }
@@ -317,12 +321,12 @@ static int enqueue_fill(struct v2d_user *u, uint32_t cmd) {
     /* TODO check validity */
     enqueue(u, cmd);
 
-    // FIXME unset?
+    reset_draw_params(u);
     return 0;
 }
 
 static int enqueue_blit(struct v2d_user *u, uint32_t cmd) {
-    if (u->src_pos.x == V2D_POS_UNSET || u->dst_pos.x == V2D_POS_UNSET) {
+    if (u->src_pos.x == V2D_COORD_UNSET || u->dst_pos.x == V2D_COORD_UNSET) {
         printk(KERN_ERR "v2d: Tried to BLIT without SRC_POS or DST_POS.\n");
         return -1;
     }
@@ -330,6 +334,7 @@ static int enqueue_blit(struct v2d_user *u, uint32_t cmd) {
     /* TODO check validity */
     enqueue(u, cmd);
 
+    reset_draw_params(u);
     return 0;
 }
 
