@@ -108,7 +108,7 @@ static void update_space(struct v2d_data *v2ddev) {
     if (v2ddev->tail >= v2ddev->head) {
         v2ddev->space = V2D_CMD_QUEUE_SIZE - 1 - v2ddev->tail + v2ddev->head - 1;
     } else {
-        v2ddev->space = V2D_CMD_QUEUE_SIZE - 1 - v2ddev->head + v2ddev->tail - 1;
+        v2ddev->space = v2ddev->head - v2ddev->tail - 1;
     }
 }
 
@@ -124,6 +124,7 @@ static void incr_head(struct v2d_data *v2ddev) {
 
 /* Requires queue lock */
 static void incr_tail(struct v2d_data *v2ddev) {
+    printk(KERN_NOTICE "incr_tail: %u\n", v2ddev->tail);
     v2ddev->tail++;
     if (v2ddev->tail >= V2D_CMD_QUEUE_SIZE - 1) {  // Intentionally skipping the last index (JUMP)
         v2ddev->tail = 0;
@@ -169,10 +170,7 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
             }
 
             printk(KERN_NOTICE "Finished cmd: id = %u type = %u\n", v2ddev->head, VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd));
-
-            mutex_lock(&v2ddev->queue_lock);
             incr_head(v2ddev);
-            mutex_unlock(&v2ddev->queue_lock);
             wake_up(&v2ddev->write_queue);
         }
 
@@ -192,8 +190,9 @@ static int v2d_open(struct inode *i, struct file *f) {
     printk(KERN_NOTICE "v2dopen...\n");
     v2ddev = container_of(i->i_cdev, struct v2d_data, cdev);
     u = kmalloc(sizeof(struct v2d_user), GFP_KERNEL);
-    if (!u)
+    if (!u) {
         return -ENOMEM;
+    }
     u->v2ddev = v2ddev;
     u->initialized = 0;
     u->pages_num = 0;
@@ -212,7 +211,9 @@ static int v2d_release(struct inode *i, struct file *f) {
     printk(KERN_NOTICE "v2drelease...\n");
     u = f->private_data;
 
-    // TODO FIXME disable queue (disable fetch and re-enable in open?)
+    if (u->v2ddev->last_user == u) {
+        u->v2ddev->last_user = NULL;
+    }
 
     if (u->initialized) {
         for (j = 0; j < u->pages_num; ++j) {
@@ -250,6 +251,7 @@ static void change_context(struct v2d_user *u) {
     printk(KERN_NOTICE "Canvas change, v2d: PT = %08X %u x %u\n", u->dpt, u->dimm.width, u->dimm.height);
     send_command(u, VINTAGE2D_CMD_CANVAS_PT((uint32_t)u->dpt, 0));
     send_command(u, VINTAGE2D_CMD_CANVAS_DIMS(u->dimm.width, u->dimm.height, 0));
+    u->v2ddev->last_user = u;
 }
 
 /* Write mutex must be held */
@@ -258,7 +260,7 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
     uint32_t size;
     uint8_t context_change;
 
-    size = 1;
+    size = 2;  // +COUNTER
     context_change = u->v2ddev->last_user != u ? 1 : 0;
 
     if (context_change) {
@@ -297,6 +299,11 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
             send_command(u, VINTAGE2D_CMD_DO_BLIT(VINTAGE2D_CMD_WIDTH(cmd), VINTAGE2D_CMD_HEIGHT(cmd), 0));
             break;
     }
+
+    printk(KERN_NOTICE "Sending counter = %llu\n", u->v2ddev->counter);
+    send_command(u, VINTAGE2D_CMD_COUNTER(u->v2ddev->counter % V2D_COUNTER_MOD, 1));
+    u->wait_for_counter = u->v2ddev->counter;
+    u->v2ddev->counter++;
 
     mutex_unlock(&u->v2ddev->queue_lock);
     return 0;
@@ -451,15 +458,6 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
         }
     }
 
-    if (rc > 0 && real_commands) {
-        mutex_lock(&u->v2ddev->queue_lock);
-        printk(KERN_NOTICE "Sending counter = %llu\n", u->v2ddev->counter);
-        send_command(u, VINTAGE2D_CMD_COUNTER(u->v2ddev->counter % V2D_COUNTER_MOD, 1));
-        u->wait_for_counter = u->v2ddev->counter;
-        u->v2ddev->counter++;
-        mutex_unlock(&u->v2ddev->queue_lock);
-    }
-
     mutex_unlock(&u->write_lock);
     kfree(data);
 
@@ -502,11 +500,11 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
     for (i = 0; i < u->pages_num; ++i) {
         u->vpages[i] = dma_pool_alloc(u->v2ddev->canvas_pool, GFP_KERNEL, &u->dpages[i]);
         u->vpt[i] = ((u->dpages[i] >> VINTAGE2D_PAGE_SHIFT) << VINTAGE2D_PAGE_SHIFT) | VINTAGE2D_PTE_VALID;
-        printk(KERN_NOTICE "v2d: Page = %08X, orig = %08X\n", u->vpt[i], u->dpages[i]);
     }
     u->initialized = 1;
 
-    printk(KERN_NOTICE "v2d: initialized canvas to %u x %u\n", u->dimm.width, u->dimm.height);
+    printk(KERN_NOTICE "v2d: initialized canvas to %u x %u. Pages num = %u\n", u->dimm.width, u->dimm.height,
+           u->pages_num);
 
     return 0;
 }
