@@ -1,3 +1,3 @@
 #!/bin/bash
-rmmod -f v2d_mod
-insmod v2d_mod.ko
+rmmod -f vintage2d
+insmod vintage2d.ko

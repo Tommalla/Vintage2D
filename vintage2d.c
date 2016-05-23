@@ -170,7 +170,9 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
             wake_up(&v2ddev->write_queue);
         }
 
-    } else {
+    }
+
+    if (intr != VINTAGE2D_INTR_NOTIFY) {
         printk(KERN_ERR "v2d: IRQ INTR = %u - that's an error.\n", intr);
     }
 
@@ -245,7 +247,7 @@ static void send_command(struct v2d_user *u, uint32_t cmd) {
 
 /* Write mutex must be held */
 static void change_context(struct v2d_user *u) {
-    printk(KERN_DEBUG "v2d: Canvas change: PT = %08X (%u x %u)\n", u->dpt, u->dimm.width, u->dimm.height);
+    printk(KERN_DEBUG "v2d: Canvas change: PT = %08X (%u x %u)\n", (uint32_t)u->dpt, u->dimm.width, u->dimm.height);
     send_command(u, VINTAGE2D_CMD_CANVAS_PT((uint32_t)u->dpt, 0));
     send_command(u, VINTAGE2D_CMD_CANVAS_DIMS(u->dimm.width, u->dimm.height, 0));
     u->v2ddev->last_user = u;
@@ -386,7 +388,7 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
     }
 
     if (size % 4) { // Not divisible by 32 bits
-        printk(KERN_ERR "v2d: Wrong write size: %u\n", size);
+        printk(KERN_ERR "v2d: Wrong write size: %zu\n", size);
         return -EINVAL;
     }
 
@@ -509,8 +511,11 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
         if (!u->vpages[i]) {
             goto err_vpage;
         }
-        u->vpt[i] = ((u->dpages[i] >> VINTAGE2D_PAGE_SHIFT) << VINTAGE2D_PAGE_SHIFT) | VINTAGE2D_PTE_VALID;
+        memset(u->vpages[i], 0, VINTAGE2D_PAGE_SIZE);
+        u->vpt[i] = u->dpages[i] | VINTAGE2D_PTE_VALID;
     }
+
+    reset(u->v2ddev, 0, 0, 1);
     u->initialized = 1;
 
     printk(KERN_NOTICE "v2d: initialized canvas to %u x %u. Pages num = %u\n", u->dimm.width, u->dimm.height,
@@ -590,7 +595,6 @@ static int v2d_fsync(struct file *f, loff_t a, loff_t b, int datasync) {
         mutex_lock(&u->write_lock);
     }
 
-    wake_up(&u->fsync_queue);
     mutex_unlock(&u->write_lock);
     return 0;
 }
@@ -725,6 +729,7 @@ static void v2d_remove(struct pci_dev *dev) {
     BUG_ON(!v2ddev);
 
     iowrite32(0, v2ddev->bar0 + VINTAGE2D_ENABLE);  // Make sure the device is disabled.
+    iowrite32(0, v2ddev->bar0 + VINTAGE2D_INTR_ENABLE);
     reset(v2ddev, 1, 1, 1);
 
     device_destroy(v2d_class, v2ddev->cdev.dev);

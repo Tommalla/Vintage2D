@@ -1,10 +1,3 @@
-
-ifneq ($(KERNELRELEASE),)
-
-obj-m := v2d_mod.o
-
-else
-
 KDIR ?= /lib/modules/`uname -r`/build
 
 default:
@@ -15,5 +8,3 @@ install:
 
 clean:
 	$(MAKE) -C $(KDIR) M=$$PWD clean
-
-endif
