@@ -19,7 +19,6 @@
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
 
-#define V2D_UNINITIALIZED_ERR "Trying to use driver before initializing context with canvas size."
 #define V2D_MAX_COUNT 256
 #define V2D_MAX_DIMM 2048
 #define V2D_COORD_UNSET (1 << 31)
@@ -45,7 +44,6 @@ struct v2d_data {
     struct cdev cdev;
     void __iomem *bar0;
     struct dma_pool *canvas_pool;
-    struct mutex dev_lock;
     struct v2d_user *last_user;
     uint64_t counter, last_counter_sync;
     uint32_t last_read_counter;
@@ -61,10 +59,15 @@ struct v2d_data {
 
 struct v2d_user {
     struct v2d_data *v2ddev;
+
+    // Synchronisation:
+    struct mutex write_lock;
+    uint64_t wait_for_counter;
+    wait_queue_head_t fsync_queue;
+
     // Context data:
     int initialized;
     struct v2d_ioctl_set_dimensions dimm;
-    struct mutex write_lock;
     void **vpages; // Canvas memory, page-by-page
     dma_addr_t *dpages;
     uint32_t *vpt;
@@ -72,8 +75,6 @@ struct v2d_user {
     int pages_num;
     struct v2d_pos src_pos, dst_pos;
     uint16_t color;
-    uint64_t wait_for_counter;
-    wait_queue_head_t fsync_queue;
 };
 
 static void set_read_ptr(struct v2d_data *v2ddev, dma_addr_t ptr) {
@@ -90,12 +91,11 @@ static void reset_draw_params(struct v2d_user *u) {
 }
 
 static void print_dev_status(struct v2d_data *v2ddev) {
-    printk(KERN_NOTICE "READ = %08X, WRITE = %08X, INTR = %u, STATUS = %u, ENABLE = %u,  FIFO_FREE = %u\n",
+    printk(KERN_DEBUG "READ = %08X, WRITE = %08X, INTR = %u, STATUS = %u, ENABLE = %u,  FIFO_FREE = %u\n",
            ioread32(v2ddev->bar0 + VINTAGE2D_CMD_READ_PTR), ioread32(v2ddev->bar0 + VINTAGE2D_CMD_WRITE_PTR),
            ioread32(v2ddev->bar0 + VINTAGE2D_INTR), ioread32(v2ddev->bar0 + VINTAGE2D_STATUS),
            ioread32(v2ddev->bar0 + VINTAGE2D_ENABLE),
            ioread32(v2ddev->bar0 + VINTAGE2D_FIFO_FREE));
-    iowrite32(31, v2ddev->bar0 + VINTAGE2D_INTR);
 }
 
 static void reset(struct v2d_data *v2ddev, uint8_t reset_draw, uint8_t reset_fifo, uint8_t reset_tlb) {
@@ -119,18 +119,18 @@ static void incr_head(struct v2d_data *v2ddev) {
         v2ddev->head = 0;
     }
     update_space(v2ddev);
-    printk(KERN_NOTICE "v2d: Moved head to %u, space = %u\n", v2ddev->head, v2ddev->space);
+    printk(KERN_DEBUG "v2d: Moved head to %u, space = %u\n", v2ddev->head, v2ddev->space);
 }
 
 /* Requires queue lock */
 static void incr_tail(struct v2d_data *v2ddev) {
-    printk(KERN_NOTICE "incr_tail: %u\n", v2ddev->tail);
+    printk(KERN_DEBUG "incr_tail: %u\n", v2ddev->tail);
     v2ddev->tail++;
     if (v2ddev->tail >= V2D_CMD_QUEUE_SIZE - 1) {  // Intentionally skipping the last index (JUMP)
         v2ddev->tail = 0;
     }
     update_space(v2ddev);
-    printk(KERN_NOTICE "v2d: Moved tail to %u, space = %u\n", v2ddev->tail, v2ddev->space);
+    printk(KERN_DEBUG "v2d: Moved tail to %u, space = %u\n", v2ddev->tail, v2ddev->space);
 }
 
 static irqreturn_t v2d_irq(int irq, void *dev) {
@@ -144,9 +144,8 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
     if (!intr) {
         return IRQ_NONE;
     }
-    printk(KERN_NOTICE "IRQ\n");
+    printk(KERN_NOTICE "v2d: IRQ INTR = %u\n", intr);
     print_dev_status(v2ddev);
-    printk(KERN_NOTICE "INTR = %d\n", intr);
 
     if (intr & VINTAGE2D_INTR_NOTIFY) {
         counter = ioread32(v2ddev->bar0 + VINTAGE2D_COUNTER);
@@ -154,31 +153,29 @@ static irqreturn_t v2d_irq(int irq, void *dev) {
         v2ddev->last_counter_sync += delta;
 
         if (counter > v2ddev->counter) {
-            return IRQ_HANDLED; // 'GARBAGE' IRQ
+            goto handle_irq;
         }
 
-        printk(KERN_NOTICE "Read counter=%u, last_read_counter=%u\n", counter, v2ddev->last_read_counter);
-        // FIXME potential problem with garbage counter at the beginning?
+        printk(KERN_DEBUG "Read counter=%u, last_read_counter=%u\n", counter, v2ddev->last_read_counter);
         while (v2ddev->last_read_counter != counter) {
             if (VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd) == VINTAGE2D_CMD_TYPE_COUNTER) {
                 struct v2d_user *u;
                 u = v2ddev->meta_queue[v2ddev->head].u;
                 v2ddev->last_read_counter = VINTAGE2D_CMD_COUNTER_VALUE(v2ddev->meta_queue[v2ddev->head].cmd);
-                printk(KERN_NOTICE "counter=%d %d %llu\n",
-                       VINTAGE2D_CMD_COUNTER_VALUE(v2ddev->meta_queue[v2ddev->head].cmd), counter, u->wait_for_counter);
                 wake_up(&u->fsync_queue);
             }
 
-            printk(KERN_NOTICE "Finished cmd: id = %u type = %u\n", v2ddev->head, VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd));
+            printk(KERN_DEBUG "Finished cmd: id = %u type = %u\n", v2ddev->head, VINTAGE2D_CMD_TYPE(v2ddev->meta_queue[v2ddev->head].cmd));
             incr_head(v2ddev);
             wake_up(&v2ddev->write_queue);
         }
 
     } else {
-        printk(KERN_ERR "v2d irq: INTR = %d\n", intr);
+        printk(KERN_ERR "v2d: IRQ INTR = %u - that's an error.\n", intr);
     }
 
-    printk(KERN_NOTICE "Handled.\n");
+handle_irq:
+    printk(KERN_DEBUG "Handled.\n");
 
     return IRQ_HANDLED;
 }
@@ -187,7 +184,7 @@ static int v2d_open(struct inode *i, struct file *f) {
     struct v2d_data *v2ddev;
     struct v2d_user *u;
 
-    printk(KERN_NOTICE "v2dopen...\n");
+    printk(KERN_INFO "v2d: open.\n");
     v2ddev = container_of(i->i_cdev, struct v2d_data, cdev);
     u = kmalloc(sizeof(struct v2d_user), GFP_KERNEL);
     if (!u) {
@@ -208,7 +205,7 @@ static int v2d_release(struct inode *i, struct file *f) {
     int j;
     struct v2d_user *u;
 
-    printk(KERN_NOTICE "v2drelease...\n");
+    printk(KERN_INFO "v2d: release.\n");
     u = f->private_data;
 
     if (u->v2ddev->last_user == u) {
@@ -236,7 +233,7 @@ static void send_command(struct v2d_user *u, uint32_t cmd) {
 
     v2ddev = u->v2ddev;
     // Put command in the queue.
-    printk(KERN_NOTICE "Enqueueing: %u %u\n", v2ddev->tail, VINTAGE2D_CMD_TYPE(cmd));
+    printk(KERN_DEBUG "v2d: Putting in the queue: (CMD_TYPE) %u (tail = %u)\n", VINTAGE2D_CMD_TYPE(cmd), v2ddev->tail);
     v2ddev->virt_cmd_queue[v2ddev->tail] = cmd;
     v2ddev->meta_queue[v2ddev->tail].u = u;
     v2ddev->meta_queue[v2ddev->tail].cmd = cmd;
@@ -248,7 +245,7 @@ static void send_command(struct v2d_user *u, uint32_t cmd) {
 
 /* Write mutex must be held */
 static void change_context(struct v2d_user *u) {
-    printk(KERN_NOTICE "Canvas change, v2d: PT = %08X %u x %u\n", u->dpt, u->dimm.width, u->dimm.height);
+    printk(KERN_DEBUG "v2d: Canvas change: PT = %08X (%u x %u)\n", u->dpt, u->dimm.width, u->dimm.height);
     send_command(u, VINTAGE2D_CMD_CANVAS_PT((uint32_t)u->dpt, 0));
     send_command(u, VINTAGE2D_CMD_CANVAS_DIMS(u->dimm.width, u->dimm.height, 0));
     u->v2ddev->last_user = u;
@@ -256,7 +253,6 @@ static void change_context(struct v2d_user *u) {
 
 /* Write mutex must be held */
 static int enqueue(struct v2d_user *u, uint32_t cmd) {
-    /* TODO enqueue in a queue */
     uint32_t size;
     uint8_t context_change;
 
@@ -268,13 +264,12 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
 
     mutex_lock(&u->v2ddev->queue_lock);
 
+    // The ternary operator is here, because this condition has to be evalued every time the loop spins.
     while (u->v2ddev->space < size + (u->v2ddev->last_user != u ? 2 : 0)) {
         mutex_unlock(&u->v2ddev->queue_lock);
-        wait_event(u->v2ddev->write_queue, u->v2ddev->space >= size + (u->v2ddev->last_user != u ? 2 : 0));
+        wait_event(u->v2ddev->write_queue, u->v2ddev->space >= size + 2);   // +2, because we have to assume the worst
         mutex_lock(&u->v2ddev->queue_lock);
     }
-
-    printk(KERN_NOTICE "Before sending commands: size = %u, space = %u\n", size, u->v2ddev->space);
 
     context_change = u->v2ddev->last_user != u ? 1 : 0; // Could have changed since we held mutex.
 
@@ -295,7 +290,7 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
             break;
     }
 
-    printk(KERN_NOTICE "Sending counter = %llu\n", u->v2ddev->counter);
+    printk(KERN_DEBUG "Sending counter = %llu\n", u->v2ddev->counter);
     send_command(u, VINTAGE2D_CMD_COUNTER(u->v2ddev->counter % V2D_COUNTER_MOD, 1));
     u->wait_for_counter = u->v2ddev->counter;
     u->v2ddev->counter++;
@@ -309,7 +304,7 @@ static int is_rect_valid(struct v2d_user *u, const struct v2d_pos *pos, uint16_t
 }
 
 /*
- * Puts the command (and the SRC_POS/DST_POS commands before it) in the command queue.
+ * Puts the command (and the DST_POS/FILL_COLOR commands before it) in the command queue.
  * This method is safe - if there is no space on the queue, it will block until enqueueing
  * is possible.
  * Write lock must be held.
@@ -331,6 +326,12 @@ static int enqueue_fill(struct v2d_user *u, uint32_t cmd) {
     return 0;
 }
 
+/*
+ * Puts the command (and the SRC_POS/DST_POS commands before it) in the command queue.
+ * This method is safe - if there is no space on the queue, it will block until enqueueing
+ * is possible.
+ * Write lock must be held.
+ */
 static int enqueue_blit(struct v2d_user *u, uint32_t cmd) {
     uint16_t width, height;
     if (u->src_pos.x == V2D_COORD_UNSET || u->dst_pos.x == V2D_COORD_UNSET) {
@@ -376,13 +377,11 @@ static int set_pos(struct v2d_user *u, uint32_t cmd, struct v2d_pos *dst) {
 static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, loff_t *off) {
     struct v2d_user *u;
     char *data, *ptr;
-    int rc, real_commands;
-
-    real_commands = 0;  // DO_*
+    int rc;
 
     u = f->private_data;
     if (!u->initialized) {
-        printk(KERN_ERR V2D_UNINITIALIZED_ERR);
+        printk(KERN_ERR "v2d: Trying to use driver before initializing context with canvas size.\n");
         return -EINVAL;
     }
 
@@ -397,9 +396,14 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
 
     data = kmalloc(sizeof(char) * size, GFP_KERNEL);
 
+    if (!data) {
+        return -ENOMEM;
+    }
+
     mutex_lock(&u->write_lock);
     if (copy_from_user(data, buf, size)) {
         mutex_unlock(&u->write_lock);
+        kfree(data);
         return -EFAULT;
     }
 
@@ -407,7 +411,8 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
 
     print_dev_status(u->v2ddev);
 
-    for (ptr = data; ptr < data + size; ptr += 4) {
+    // We'll try to handle as many commands as possible until we hit the first errorneous.
+    for (ptr = data; ptr < data + size && rc >= 0; ptr += 4) {
         uint32_t cmd = *(uint32_t*)ptr;
         uint8_t cmd_type = cmd % (1 << 8);
         uint32_t c;
@@ -438,13 +443,11 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
                 if (enqueue_blit(u, cmd)) {
                     rc = -EINVAL;
                 }
-                real_commands++;
                 break;
             case V2D_CMD_TYPE_DO_FILL:
                 if (enqueue_fill(u, cmd)) {
                     rc = -EINVAL;
                 }
-                real_commands++;
                 break;
 
             default:
@@ -486,14 +489,26 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
     u->pages_num = size / VINTAGE2D_PAGE_SIZE + ((size % VINTAGE2D_PAGE_SIZE) > 0 ? 1 : 0);
 
-    // FIXME handle ENOMEM
-
     u->vpages = kmalloc(sizeof(void *) * u->pages_num, GFP_KERNEL);
+    if (!u->vpages) {
+        goto err_vpages;
+    }
+
     u->dpages = kmalloc(sizeof(dma_addr_t) * u->pages_num, GFP_KERNEL);
+    if (!u->dpages) {
+        goto err_dpages;
+    }
+
     u->vpt = dma_pool_alloc(u->v2ddev->canvas_pool, GFP_KERNEL, &u->dpt);   // There will never be more than 1024 pages,
-                                                                            // so a page is enough and well-aligned.
+    if (!u->vpt) {                                                          // so a page is enough and well-aligned.
+        goto err_vpt;
+    }
+
     for (i = 0; i < u->pages_num; ++i) {
         u->vpages[i] = dma_pool_alloc(u->v2ddev->canvas_pool, GFP_KERNEL, &u->dpages[i]);
+        if (!u->vpages[i]) {
+            goto err_vpage;
+        }
         u->vpt[i] = ((u->dpages[i] >> VINTAGE2D_PAGE_SHIFT) << VINTAGE2D_PAGE_SHIFT) | VINTAGE2D_PTE_VALID;
     }
     u->initialized = 1;
@@ -502,12 +517,24 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
            u->pages_num);
 
     return 0;
+
+err_vpage:
+    while (--i) {
+        dma_pool_free(u->v2ddev->canvas_pool, u->vpages[i], u->dpages[i]);
+    }
+    dma_pool_free(u->v2ddev->canvas_pool, u->vpt, u->dpt);
+err_vpt:
+    kfree(u->dpages);
+err_dpages:
+    kfree(u->vpages);
+err_vpages:
+    return -ENOMEM;
 }
 
 static int v2d_mmap(struct file *f, struct vm_area_struct *vma) {
     struct v2d_user *u;
     unsigned long uaddr, usize;
-    int i;
+    uint32_t i;
 
     uaddr = vma->vm_start;
     usize = vma->vm_end - vma->vm_start;
@@ -516,7 +543,7 @@ static int v2d_mmap(struct file *f, struct vm_area_struct *vma) {
 
     u = f->private_data;
     if (!u->initialized) {
-        printk(KERN_ERR V2D_UNINITIALIZED_ERR);
+        printk(KERN_ERR "v2d: Tried to perform mmap on uninitialized canvas.\n");
         return -EINVAL;
     }
 
@@ -526,7 +553,7 @@ static int v2d_mmap(struct file *f, struct vm_area_struct *vma) {
     }
 
     if (i >= u->pages_num) {
-        printk(KERN_ERR "v2d: (Possible drvier bug) tried to map a page id bigger than pages_num: %d\n", i);
+        printk(KERN_ERR "v2d: (Possible drvier bug) tried to map a page id bigger than pages_num: %u\n", i);
         return -EINVAL;
     }
 
@@ -551,7 +578,7 @@ static int v2d_fsync(struct file *f, loff_t a, loff_t b, int datasync) {
 
     u = f->private_data;
     if (!u->initialized) {
-        printk(KERN_ERR V2D_UNINITIALIZED_ERR);
+        printk(KERN_ERR "v2d: Tried to perform fsync on an uninitialized canvas.");
         return -EINVAL;
     }
 
@@ -633,7 +660,6 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
         goto err_dev_cmd_queue;
     }
 
-    /* TODO: lock */
     minor = idr_alloc(&v2ddev_idr, v2ddev, 0, V2D_MAX_COUNT, GFP_KERNEL);
     if (IS_ERR_VALUE(minor)) {
         rc = minor;
@@ -648,7 +674,6 @@ static int v2d_probe(struct pci_dev *dev, const struct pci_device_id *id) {
         goto err_dev;
     }
 
-    mutex_init(&v2ddev->dev_lock);
     mutex_init(&v2ddev->queue_lock);
     init_waitqueue_head(&v2ddev->write_queue);
     v2ddev->virt_cmd_queue[V2D_CMD_QUEUE_SIZE - 1] = VINTAGE2D_CMD_KIND_JUMP | ((v2ddev->dev_cmd_queue >> 2) << 2);
@@ -698,8 +723,6 @@ static void v2d_remove(struct pci_dev *dev) {
 
     v2ddev = pci_get_drvdata(dev);
     BUG_ON(!v2ddev);
-
-    /* TODO: check for device users */
 
     iowrite32(0, v2ddev->bar0 + VINTAGE2D_ENABLE);  // Make sure the device is disabled.
     reset(v2ddev, 1, 1, 1);
