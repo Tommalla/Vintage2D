@@ -214,12 +214,14 @@ static int v2d_release(struct inode *i, struct file *f) {
 
     // TODO FIXME disable queue (disable fetch and re-enable in open?)
 
-    for (j = 0; j < u->pages_num; ++j) {
-        dma_pool_free(u->v2ddev->canvas_pool, u->vpages[j], u->dpages[j]);
+    if (u->initialized) {
+        for (j = 0; j < u->pages_num; ++j) {
+            dma_pool_free(u->v2ddev->canvas_pool, u->vpages[j], u->dpages[j]);
+        }
+        dma_pool_free(u->v2ddev->canvas_pool, u->vpt, u->dpt);
+        kfree(u->vpages);
+        kfree(u->dpages);
     }
-    dma_pool_free(u->v2ddev->canvas_pool, u->vpt, u->dpt);
-    kfree(u->vpages);
-    kfree(u->dpages);
     kfree(u);
     return 0;
 }
@@ -300,6 +302,10 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
     return 0;
 }
 
+static int is_rect_valid(struct v2d_user *u, const struct v2d_pos *pos, uint16_t width, uint16_t height) {
+    return ((pos->x + width <= u->dimm.width) && (pos->y + height <= u->dimm.height));
+}
+
 /*
  * Puts the command (and the SRC_POS/DST_POS commands before it) in the command queue.
  * This method is safe - if there is no space on the queue, it will block until enqueueing
@@ -312,7 +318,11 @@ static int enqueue_fill(struct v2d_user *u, uint32_t cmd) {
         return -1;
     }
 
-    /* TODO check validity */
+    if (!is_rect_valid(u, &u->dst_pos, V2D_CMD_WIDTH(cmd), V2D_CMD_HEIGHT(cmd))) {
+        printk(KERN_ERR "v2d: Tried to do FILL outside canvas.\n");
+        return -1;
+    }
+
     enqueue(u, cmd);
 
     reset_draw_params(u);
@@ -320,12 +330,20 @@ static int enqueue_fill(struct v2d_user *u, uint32_t cmd) {
 }
 
 static int enqueue_blit(struct v2d_user *u, uint32_t cmd) {
+    uint16_t width, height;
     if (u->src_pos.x == V2D_COORD_UNSET || u->dst_pos.x == V2D_COORD_UNSET) {
         printk(KERN_ERR "v2d: Tried to BLIT without SRC_POS or DST_POS.\n");
         return -1;
     }
 
-    /* TODO check validity */
+    width = V2D_CMD_WIDTH(cmd);
+    height = V2D_CMD_HEIGHT(cmd);
+
+    if (!is_rect_valid(u, &u->dst_pos, width, height) || !is_rect_valid(u, &u->src_pos, width, height)) {
+        printk(KERN_ERR "v2d: Tried to do BLIT outside canvas.\n");
+        return -1;
+    }
+
     enqueue(u, cmd);
 
     reset_draw_params(u);
@@ -455,7 +473,7 @@ static long v2d_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
     if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
         printk(KERN_ERR "ioctl used for an unknown command: %u\n", cmd);
-        return -EINVAL;
+        return -ENOTTY;
     }
 
     if (u->initialized) {
