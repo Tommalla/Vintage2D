@@ -3,6 +3,8 @@
 #include "v2d-testlib.h"
 
 
+#define BR_SIZE 1022
+
 int main(int argc, char **argv) {
     int fd;
     char *canvas;
@@ -27,26 +29,26 @@ int main(int argc, char **argv) {
                             exit(1);
                         case 0:
                             color = 0x27;
-                            size = 1022;
+                            size = BR_SIZE;
                             bg = 0x33;
                             break;
                         default:
                             color = 0x3c;
-                            size = 1022;
+                            size = BR_SIZE;
                             bg = 0xdd;
                             break;
                     }
                     break;
                 default:
                     color = 0x4a;
-                    size = 1022;
+                    size = BR_SIZE;
                     bg = 0xee;
                     break;
             }
             break;
         default:
             color = 0x17;
-            size = 1022;
+            size = BR_SIZE;
             bg = 0xcc;
             break;
     }

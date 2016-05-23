@@ -261,12 +261,6 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
     uint8_t context_change;
 
     size = 2;  // +COUNTER
-    context_change = u->v2ddev->last_user != u ? 1 : 0;
-
-    if (context_change) {
-        // Context change needed
-        size += 2;
-    }
 
     if (VINTAGE2D_CMD_TYPE(cmd) == VINTAGE2D_CMD_TYPE_DO_FILL || VINTAGE2D_CMD_TYPE(cmd) == VINTAGE2D_CMD_TYPE_DO_BLIT) {
         size += 2; //DST_POS, SRC_POS / FILL_COLOR
@@ -274,15 +268,16 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
 
     mutex_lock(&u->v2ddev->queue_lock);
 
-    while (u->v2ddev->space < size) {
+    while (u->v2ddev->space < size + (u->v2ddev->last_user != u ? 2 : 0)) {
         mutex_unlock(&u->v2ddev->queue_lock);
-        wait_event(u->v2ddev->write_queue, u->v2ddev->space >= size);
+        wait_event(u->v2ddev->write_queue, u->v2ddev->space >= size + (u->v2ddev->last_user != u ? 2 : 0));
         mutex_lock(&u->v2ddev->queue_lock);
     }
 
     printk(KERN_NOTICE "Before sending commands: size = %u, space = %u\n", size, u->v2ddev->space);
 
-    // Temporarily commented out:
+    context_change = u->v2ddev->last_user != u ? 1 : 0; // Could have changed since we held mutex.
+
     if (context_change) {
         change_context(u);
     }
