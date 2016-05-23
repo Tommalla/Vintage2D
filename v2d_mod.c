@@ -256,8 +256,7 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
     uint32_t size;
     uint8_t context_change;
 
-    // FIXME move counter after write
-    size = 2;   // COUNTER
+    size = 1;
     context_change = u->v2ddev->last_user != u ? 1 : 0;
 
     if (context_change) {
@@ -296,11 +295,6 @@ static int enqueue(struct v2d_user *u, uint32_t cmd) {
             send_command(u, VINTAGE2D_CMD_DO_BLIT(VINTAGE2D_CMD_WIDTH(cmd), VINTAGE2D_CMD_HEIGHT(cmd), 0));
             break;
     }
-
-    printk(KERN_NOTICE "Sending counter = %llu\n", u->v2ddev->counter);
-    send_command(u, VINTAGE2D_CMD_COUNTER(u->v2ddev->counter % V2D_COUNTER_MOD, 1));
-    u->wait_for_counter = u->v2ddev->counter;
-    u->v2ddev->counter++;
 
     mutex_unlock(&u->v2ddev->queue_lock);
     return 0;
@@ -362,7 +356,9 @@ static int set_pos(struct v2d_user *u, uint32_t cmd, struct v2d_pos *dst) {
 static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, loff_t *off) {
     struct v2d_user *u;
     char *data, *ptr;
-    int rc;
+    int rc, real_commands;
+
+    real_commands = 0;  // DO_*
 
     u = f->private_data;
     if (!u->initialized) {
@@ -422,17 +418,28 @@ static ssize_t v2d_write(struct file *f, const char __user *buf, size_t size, lo
                 if (enqueue_blit(u, cmd)) {
                     rc = -EINVAL;
                 }
+                real_commands++;
                 break;
             case V2D_CMD_TYPE_DO_FILL:
                 if (enqueue_fill(u, cmd)) {
                     rc = -EINVAL;
                 }
+                real_commands++;
                 break;
 
             default:
                 printk(KERN_ERR "v2d: Unknown command: %02X\n", cmd_type);
                 rc = -EINVAL;
         }
+    }
+
+    if (rc > 0 && real_commands) {
+        mutex_lock(&u->v2ddev->queue_lock);
+        printk(KERN_NOTICE "Sending counter = %llu\n", u->v2ddev->counter);
+        send_command(u, VINTAGE2D_CMD_COUNTER(u->v2ddev->counter % V2D_COUNTER_MOD, 1));
+        u->wait_for_counter = u->v2ddev->counter;
+        u->v2ddev->counter++;
+        mutex_unlock(&u->v2ddev->queue_lock);
     }
 
     mutex_unlock(&u->write_lock);
