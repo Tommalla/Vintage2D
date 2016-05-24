@@ -1,0 +1,983 @@
+diff --git a/hw/misc/Makefile.objs b/hw/misc/Makefile.objs
+index aeb6b7d..48e8661 100644
+--- a/hw/misc/Makefile.objs
++++ b/hw/misc/Makefile.objs
+@@ -41,3 +41,5 @@ obj-$(CONFIG_STM32F2XX_SYSCFG) += stm32f2xx_syscfg.o
+ 
+ obj-$(CONFIG_PVPANIC) += pvpanic.o
+ obj-$(CONFIG_EDU) += edu.o
++
++common-obj-$(CONFIG_PCI) += vintage2d.o
+diff --git a/hw/misc/vintage2d.c b/hw/misc/vintage2d.c
+new file mode 100644
+index 0000000..22119a2
+--- /dev/null
++++ b/hw/misc/vintage2d.c
+@@ -0,0 +1,858 @@
++/*
++ * Vintage2D™ device
++ *
++ * Copyright (C) 2013-2016 Marcin Kościelnicki
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2.  See
++ * the COPYING file in the top-level directory.
++ */
++
++#include "vintage2d.h"
++#include "hw/hw.h"
++#include "hw/pci/pci.h"
++
++typedef struct {
++	PCIDevice dev;
++	/* These correspond directly to documented registers.  */
++	uint32_t enable;
++	uint32_t status;
++	uint32_t intr;
++	uint32_t intr_enable;
++	uint32_t cmd_read_ptr;
++	uint32_t cmd_write_ptr;
++	/* Undocumented registers... */
++	/* Value of last DRAW_STATE_CANVAS_PT, bits fffff000.  */
++	uint32_t canvas_pt;
++	/* Value of last DRAW_STATE_CANVAS_DIMS, bits 7ff7ff00.  */
++	uint32_t canvas_dims;
++	/* Current source position.  Set by DRAW_STATE_SRC_POS,
++	 * updated during blits/fills to position of the next pixel
++	 * to read. Bits 7ff7ff00.  */
++	uint32_t src_pos;
++	/* Likewise for destination.  */
++	uint32_t dst_pos;
++	/* Value of last DRAW_STATE_FILL_COLOR.  Bits 0000ff00.  */
++	uint32_t fill_color;
++	/* Value of last DRAW_STATE_COUNTER.  Bits ffffff00.  */
++	uint32_t counter;
++	/* The single-entry TLBs, one for source and one for destination.
++	 * Tags have bits fffffffc: bits 12-31 of tag are bits 12-31
++	 * of canvas_pt, and bits 2-11 are virtual page index.
++	 * This means tag is effectively equivalent to the physical
++	 * address of the PTE.  pte is simply the cached value of PTE,
++	 * valid if bit 0 is set.  As a side effect, this means we don't
++	 * cache page faults in the TLBs.  */
++	uint32_t src_tlb_tag;
++	uint32_t src_tlb_pte;
++	uint32_t dst_tlb_tag;
++	uint32_t dst_tlb_pte;
++	/* Information about the current operation in progress:
++	 * bits 00007ffd.  Bit 0 is set if we're doing a blit (unset
++	 * for a fill).  Bit 2 is set if we're doing the blit right-to-left.
++	 * Bit 3 is set if we're doing the blit down-to-up (towards lower y).
++	 * Bits 4-14 are width-1 of the current operation, used to reset
++	 * draw_left for a new line.  */
++	uint32_t draw_state;
++	/* State of the current operation in progress: bits 00ffffff.
++	 * Bits 0-11 are number of pixels left to process in the current line,
++	 * bits 12-23 are number of lines left to process after this one.
++	 * STATUS_DRAW is set iff this register is non-0.  */
++	uint32_t draw_left;
++	/* State of the FIFO, bits 00003f3f.  There are 0x20 entries, indexed
++	   by 6-bit indices (each entry is visible under two indices).  Bits
++	   0-5 is read pointer (index of the next entry to be read by DRAW),
++	   8-13 is write pointer (index of the next entry to be written by
++	   FIFO_SEND).  FIFO is empty iff read == write, full iff read ==
++	   write ^ 0x20.  Situations where ((write - read) & 0x3f) > 0x20
++	   are illegal and won't be reached in proper operation of the
++	   device.  */
++	uint32_t fifo_state;
++	/* Contents of the FIFO.  */
++	uint32_t fifo_cmd[VINTAGE2D_FIFO_CMD_NUM];
++	QEMUTimer *timer;
++	MemoryRegion mmio;
++} V2DdevState;
++
++static const VMStateDescription vmstate_vintage2d = {
++	.name = "vintage2d",
++	.version_id = 3,
++	.minimum_version_id = 3,
++	.minimum_version_id_old = 3,
++	.fields = (VMStateField[]) {
++		VMSTATE_PCI_DEVICE(dev, V2DdevState),
++		VMSTATE_UINT32(enable, V2DdevState),
++		VMSTATE_UINT32(status, V2DdevState),
++		VMSTATE_UINT32(intr, V2DdevState),
++		VMSTATE_UINT32(intr_enable, V2DdevState),
++		VMSTATE_UINT32(cmd_read_ptr, V2DdevState),
++		VMSTATE_UINT32(cmd_write_ptr, V2DdevState),
++		VMSTATE_UINT32(canvas_pt, V2DdevState),
++		VMSTATE_UINT32(canvas_dims, V2DdevState),
++		VMSTATE_UINT32(src_pos, V2DdevState),
++		VMSTATE_UINT32(dst_pos, V2DdevState),
++		VMSTATE_UINT32(fill_color, V2DdevState),
++		VMSTATE_UINT32(counter, V2DdevState),
++		VMSTATE_UINT32(src_tlb_tag, V2DdevState),
++		VMSTATE_UINT32(src_tlb_pte, V2DdevState),
++		VMSTATE_UINT32(dst_tlb_tag, V2DdevState),
++		VMSTATE_UINT32(dst_tlb_pte, V2DdevState),
++		VMSTATE_UINT32(draw_state, V2DdevState),
++		VMSTATE_UINT32(draw_left, V2DdevState),
++		VMSTATE_UINT32(fifo_state, V2DdevState),
++		VMSTATE_UINT32_ARRAY(fifo_cmd, V2DdevState, VINTAGE2D_FIFO_CMD_NUM),
++		VMSTATE_END_OF_LIST()
++	}
++};
++
++static uint32_t le32_read(uint8_t *ptr) {
++	return ptr[0] | ptr[1] << 8 | ptr[2] << 16 | ptr[3] << 24;
++}
++
++/* Recomputes status register and PCI interrupt line.  */
++static void vintage2d_status_update(V2DdevState *d) {
++	d->status = 0;
++	/* DRAW busy iff draw_left non-0.  */
++	if (d->draw_left)
++		d->status |= VINTAGE2D_STATUS_DRAW;
++	/* FIFO busy iff read != write.  */
++	int rptr = VINTAGE2D_FIFO_STATE_READ(d->fifo_state);
++	int wptr = VINTAGE2D_FIFO_STATE_WRITE(d->fifo_state);
++	if (rptr != wptr)
++		d->status |= VINTAGE2D_STATUS_FIFO;
++	/* FETCH_CMD busy iff read != write.  */
++	if (d->cmd_read_ptr != d->cmd_write_ptr)
++		d->status |= VINTAGE2D_STATUS_FETCH_CMD;
++	/* determine and set PCI interrupt status */
++	pci_set_irq(PCI_DEVICE(d), !!(d->intr & d->intr_enable));
++}
++
++/* Returns number of free slots in the FIFO.  */
++static int vintage2d_fifo_free(V2DdevState *d) {
++	int rptr = VINTAGE2D_FIFO_STATE_READ(d->fifo_state);
++	int wptr = VINTAGE2D_FIFO_STATE_WRITE(d->fifo_state);
++	int used = (wptr - rptr) & 0x3f;
++	/* This considers overfull FIFO to have free slots.
++	 * It's part of the fun.  */
++	return (0x20 - used) & 0x3f;
++}
++
++/* Schedules our worker timer.  Should be called whenever device has new
++   work to do (eg. after FIFO_SEND).  status_update has to be called first,
++   if necessary.  */
++static void vintage2d_schedule(V2DdevState *d) {
++	/* Draw can draw, or start a new command. */
++	bool draw_busy = (d->status & (VINTAGE2D_STATUS_DRAW | VINTAGE2D_STATUS_FIFO)) && (d->enable & VINTAGE2D_ENABLE_DRAW);
++	bool fetch_cmd_busy = (d->status & VINTAGE2D_STATUS_FETCH_CMD) && (d->enable & VINTAGE2D_ENABLE_FETCH_CMD) && vintage2d_fifo_free(d);
++	/* no active blocks - return */
++	if (!draw_busy && !fetch_cmd_busy)
++		return;
++	timer_mod(d->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + (lrand48() % 1000) * 1000);
++}
++
++/* Resets DRAW unit, making it idle and ready to accept a new command.  */
++static void vintage2d_reset_draw(V2DdevState *d) {
++	/* The bare minimum.  */
++	d->draw_left = 0;
++	vintage2d_status_update(d);
++}
++
++/* Resets FIFO unit, making it empty.  */
++static void vintage2d_reset_fifo(V2DdevState *d) {
++	/* Set both read and write pointers to 0.  */
++	d->fifo_state = 0;
++	vintage2d_status_update(d);
++	/* This could wake up FETCH_CMD...  but if it does, someone's
++	 * doing something stupid.  */
++	vintage2d_schedule(d);
++}
++
++/* Resets TLBs, forcing a reread of PT.  */
++static void vintage2d_reset_tlb(V2DdevState *d) {
++	/* Set PTEs to 0, including their valid bits.  */
++	d->src_tlb_pte = 0;
++	d->dst_tlb_pte = 0;
++}
++
++/* Checks if command is valid (and not a JUMP).  */
++static bool vintage2d_valid_cmd(uint32_t val) {
++	/* JUMPs are handled elsewhere.  If we see one here, it's bad.  */
++	if (val & 2)
++		return false;
++	switch (VINTAGE2D_CMD_TYPE(val)) {
++		case VINTAGE2D_CMD_TYPE_CANVAS_PT:
++			return !(val & ~0xfffff0ff);
++		case VINTAGE2D_CMD_TYPE_CANVAS_DIMS:
++			return !(val & ~0x7ff7ffff);
++		case VINTAGE2D_CMD_TYPE_SRC_POS:
++			return !(val & ~0x7ff7ffff);
++		case VINTAGE2D_CMD_TYPE_DST_POS:
++			return !(val & ~0x7ff7ffff);
++		case VINTAGE2D_CMD_TYPE_FILL_COLOR:
++			return !(val & ~0x0000ffff);
++		case VINTAGE2D_CMD_TYPE_DO_BLIT:
++			return !(val & ~0x7ff7ffff);
++		case VINTAGE2D_CMD_TYPE_DO_FILL:
++			return !(val & ~0x7ff7ffff);
++		case VINTAGE2D_CMD_TYPE_COUNTER:
++			return !(val & ~0xffffffff);
++		default:
++			return false;
++	}
++}
++
++/* Makes given interrupt(s) pending.  */
++static void vintage2d_trigger(V2DdevState *d, uint32_t intr) {
++	d->intr |= intr;
++	vintage2d_status_update(d);
++}
++
++/* Handles FIFO_SEND - appends a command to FIFO, or triggers INVALID_CMD
++ * or FIFO_OVERFLOW.  */
++static void vintage2d_fifo_send(V2DdevState *d, uint32_t val) {
++	int free = vintage2d_fifo_free(d);
++	if (!free) {
++		vintage2d_trigger(d, VINTAGE2D_INTR_FIFO_OVERFLOW);
++	} else if (!vintage2d_valid_cmd(val)) {
++		vintage2d_trigger(d, VINTAGE2D_INTR_INVALID_CMD);
++	} else {
++		int rptr = VINTAGE2D_FIFO_STATE_READ(d->fifo_state);
++		int wptr = VINTAGE2D_FIFO_STATE_WRITE(d->fifo_state);
++		d->fifo_cmd[wptr & 0x1f] = val;
++		wptr++;
++		wptr &= 0x3f;
++		d->fifo_state = rptr | wptr << 8;
++		/* DRAW has work to do now.  */
++		vintage2d_status_update(d);
++		vintage2d_schedule(d);
++	}
++}
++
++/* Executes a blit command - sets up draw_state and draw_left, maybe
++   adjusts src_pos and dst_pos.  Actual drawing will happen later.  */
++static void vintage2d_do_blit(V2DdevState *d, uint32_t val) {
++	int w = VINTAGE2D_CMD_WIDTH(val);
++	int h = VINTAGE2D_CMD_HEIGHT(val);
++	/* Blits are tricky.  */
++	d->draw_state = (w - 1) << 4 | VINTAGE2D_DRAW_STATE_MODE_BLIT;
++	d->draw_left = (h - 1) << 12 | w;
++	int src_pos_y = VINTAGE2D_CMD_POS_Y(d->src_pos);
++	int src_pos_x = VINTAGE2D_CMD_POS_X(d->src_pos);
++	int dst_pos_y = VINTAGE2D_CMD_POS_Y(d->dst_pos);
++	int dst_pos_x = VINTAGE2D_CMD_POS_X(d->dst_pos);
++	if (src_pos_y < dst_pos_y) {
++		/* We have to blit upwards.  */
++		d->draw_state |= VINTAGE2D_DRAW_STATE_DIR_Y_UP;
++		/* Adjust current position to bottom edge. */
++		src_pos_y += h - 1;
++		dst_pos_y += h - 1;
++		/* Minor hw bug #1: no overflow checking here.  If this
++		   overflows to something in-bounds, it'll be blitted,
++		   and you'll only get an overflow once blitter goes back
++		   and hits the top edge of canvas... unless you hit bug
++		   #3 too!  */
++		src_pos_y &= 0x7ff;
++		dst_pos_y &= 0x7ff;
++	}
++	if (src_pos_x < dst_pos_x) {
++		/* We have to blit leftwards.  */
++		d->draw_state |= VINTAGE2D_DRAW_STATE_DIR_X_LEFT;
++		src_pos_x += w - 1;
++		dst_pos_x += w - 1;
++		/* Likewise, no overflow checking here, same consequences.  */
++		src_pos_x &= 0x7ff;
++		dst_pos_x &= 0x7ff;
++	}
++	d->src_pos = src_pos_y << 20 | src_pos_x << 8;
++	d->dst_pos = dst_pos_y << 20 | dst_pos_x << 8;
++	vintage2d_status_update(d);
++	vintage2d_schedule(d);
++}
++
++/* Executes a fill command - sets up draw_state and draw_left.
++   Actual drawing will happen later.  */
++static void vintage2d_do_fill(V2DdevState *d, uint32_t val) {
++	int w = VINTAGE2D_CMD_WIDTH(val);
++	int h = VINTAGE2D_CMD_HEIGHT(val);
++	/* Fills are easy.  */
++	d->draw_state = (w - 1) << 4;
++	d->draw_left = (h - 1) << 12 | w;
++	vintage2d_status_update(d);
++	vintage2d_schedule(d);
++}
++
++/* Converts src_pos or dst_pos to a physical address - handles XY
++   conversion and PT lookup.  If something goes wrong, disables
++   DRAW_ENABLE, fires an interrupt, and returns junk.  */
++
++static uint32_t vintage2d_canvas_addr(V2DdevState *d, bool is_src) {
++	uint32_t pos = is_src ? d->src_pos : d->dst_pos;
++	/* First, XY conversion.  */
++	int x = VINTAGE2D_CMD_POS_X(pos);
++	int y = VINTAGE2D_CMD_POS_Y(pos);
++	int w = VINTAGE2D_CMD_WIDTH(d->canvas_dims);
++	int h = VINTAGE2D_CMD_HEIGHT(d->canvas_dims);
++	if (x >= w || y >= h) {
++		/* Fire an interrupt and disable ourselves... but don't
++		 * return just yet, use the invalid address for PT
++		 * translation, maybe we'll get a page fault as well!
++		 * (minor hw bug #2).  */
++		d->enable &= ~VINTAGE2D_ENABLE_DRAW;
++		vintage2d_trigger(d, VINTAGE2D_INTR_CANVAS_OVERFLOW);
++	}
++	uint32_t vaddr = y * w + x;
++	/* Now do address translation.  */
++	uint32_t tag = d->canvas_pt | (vaddr >> 12 << 2);
++	uint32_t cur_tag = is_src ? d->src_tlb_tag : d->dst_tlb_tag;
++	uint32_t pte = is_src ? d->src_tlb_pte : d->dst_tlb_pte;
++	if (tag != cur_tag || !(pte & VINTAGE2D_PTE_VALID)) {
++		/* Mismatched tag, or invalid PTE - fetch a new one.  */
++		uint8_t pteb[4];
++		pci_dma_read(&d->dev, tag, &pteb, sizeof pteb);
++		pte = le32_read(pteb) & 0xfffff001;
++		if (is_src) {
++			d->src_tlb_tag = tag;
++			d->src_tlb_pte = pte;
++		} else {
++			d->dst_tlb_tag = tag;
++			d->dst_tlb_pte = pte;
++		}
++	}
++	if (!(pte & VINTAGE2D_PTE_VALID)) {
++		d->enable &= ~VINTAGE2D_ENABLE_DRAW;
++		vintage2d_trigger(d, VINTAGE2D_INTR_PAGE_FAULT);
++	}
++	return (pte & 0xfffff000) | (vaddr & 0xfff);
++}
++
++/* Main loop of the DRAW unit.  Does a random amount of work.  */
++static void vintage2d_tick_draw(V2DdevState *d) {
++	/* Make the device as evil as easily possible by randomizing everything. */
++	/* First, determine how many units of work we do this time. */
++	int work_cnt = lrand48() & 0x3ff;
++	while (work_cnt > 0) {
++		/* We may self-disable while working if we hit an error.  */
++		if (!(d->enable & VINTAGE2D_ENABLE_DRAW))
++			return;
++		if (d->status & VINTAGE2D_STATUS_DRAW) {
++			/* First, draw if there's drawing to do.  */
++			int left_pixels = VINTAGE2D_DRAW_LEFT_PIXELS(d->draw_left);
++			int left_lines = VINTAGE2D_DRAW_LEFT_LINES(d->draw_left);
++			if (left_pixels) {
++				/* We're already working on a line - continue. */
++				uint32_t src_addr = 0, dst_addr;
++				bool is_blit = !!(d->draw_state & VINTAGE2D_DRAW_STATE_MODE_BLIT);
++				if (is_blit)
++					src_addr = vintage2d_canvas_addr(d, true);
++				dst_addr = vintage2d_canvas_addr(d, false);
++				/* Could be a canvas overflow, or a page fault.  */
++				if (!(d->enable & VINTAGE2D_ENABLE_DRAW))
++					return;
++				uint8_t buf[0x1000];
++				/* Determine how many pixels to process this run.  */
++				int cnt = left_pixels;
++				int cnt_src, cnt_dst, cnt_src_page, cnt_dst_page;
++				if (d->draw_state & VINTAGE2D_DRAW_STATE_DIR_X_LEFT) {
++					/* Don't go out of this page.  */
++					cnt_src_page = (src_addr & 0xfff) + 1;
++					cnt_dst_page = (dst_addr & 0xfff) + 1;
++					/* And don't go out of the canvas (if this is the limitting factor, there'll be an error in the next iteration.  */
++					cnt_src = VINTAGE2D_CMD_POS_X(d->src_pos) + 1;
++					cnt_dst = VINTAGE2D_CMD_POS_X(d->dst_pos) + 1;
++				} else {
++					cnt_src_page = 0x1000 - (src_addr & 0xfff);
++					cnt_dst_page = 0x1000 - (dst_addr & 0xfff);
++					cnt_src = VINTAGE2D_CMD_WIDTH(d->canvas_dims) - VINTAGE2D_CMD_POS_X(d->src_pos);
++					cnt_dst = VINTAGE2D_CMD_WIDTH(d->canvas_dims) - VINTAGE2D_CMD_POS_X(d->dst_pos);
++				}
++				if (is_blit) {
++					if (cnt_src < cnt)
++						cnt = cnt_src;
++					if (cnt_src_page < cnt)
++						cnt = cnt_src_page;
++				}
++				if (cnt_dst < cnt)
++					cnt = cnt_dst;
++				if (cnt_dst_page < cnt)
++					cnt = cnt_dst_page;
++				/* Start address.  */
++				if (d->draw_state & VINTAGE2D_DRAW_STATE_DIR_X_LEFT) {
++					/* If drawing leftwards, pos points at
++					 * the rightmost pixel of current span
++					 * - adjust it.  */
++					src_addr -= cnt - 1;
++					dst_addr -= cnt - 1;
++				}
++				if (is_blit) {
++					/* Read the source.  */
++					pci_dma_read(&d->dev, src_addr, buf, cnt);
++					/* Update source position.  */
++					int pos_y = VINTAGE2D_CMD_POS_Y(d->src_pos);
++					int pos_x = VINTAGE2D_CMD_POS_X(d->src_pos);
++					if (d->draw_state & VINTAGE2D_DRAW_STATE_DIR_X_LEFT)
++						pos_x -= cnt;
++					else
++						pos_x += cnt;
++					/* Minor hw bug #3: no overflow check here.
++					 * If there are more pixels to draw, the next
++					 * span will give an error... unless width is 2048 pixels, which will happily wrap to the other edge instead.  */
++					pos_x &= 0x7ff;
++					d->src_pos = pos_x << 8 | pos_y << 20;
++				} else {
++					memset(buf, d->fill_color >> 8, cnt);
++				}
++				/* Write the destination.  */
++				pci_dma_write(&d->dev, dst_addr, buf, cnt);
++				/* Update destination position.  */
++				int pos_y = VINTAGE2D_CMD_POS_Y(d->dst_pos);
++				int pos_x = VINTAGE2D_CMD_POS_X(d->dst_pos);
++				if (d->draw_state & VINTAGE2D_DRAW_STATE_DIR_X_LEFT)
++					pos_x -= cnt;
++				else
++					pos_x += cnt;
++				pos_x &= 0x7ff;
++				d->dst_pos = pos_x << 8 | pos_y << 20;
++				/* And mark as done.  */
++				left_pixels -= cnt;
++			} else if (left_lines) {
++				/* Start work on a new line. */
++				left_lines--;
++				left_pixels = VINTAGE2D_DRAW_STATE_WIDTHM1(d->draw_state) + 1;
++				int dst_pos_x = VINTAGE2D_CMD_POS_X(d->dst_pos);
++				int dst_pos_y = VINTAGE2D_CMD_POS_Y(d->dst_pos);
++				int src_pos_x = VINTAGE2D_CMD_POS_X(d->src_pos);
++				int src_pos_y = VINTAGE2D_CMD_POS_Y(d->src_pos);
++				/* Go to the next line.  */
++				if (d->draw_state & VINTAGE2D_DRAW_STATE_DIR_Y_UP) {
++					src_pos_y--;
++					dst_pos_y--;
++				} else {
++					src_pos_y++;
++					dst_pos_y++;
++				}
++				/* Again, no overflow checking here.  */
++				src_pos_y &= 0x7ff;
++				dst_pos_y &= 0x7ff;
++				/* Go back to the beginning of the line.  */
++				if (d->draw_state & VINTAGE2D_DRAW_STATE_DIR_X_LEFT) {
++					src_pos_x += left_pixels;
++					dst_pos_x += left_pixels;
++				} else {
++					src_pos_x -= left_pixels;
++					dst_pos_x -= left_pixels;
++				}
++				src_pos_x &= 0x7ff;
++				dst_pos_x &= 0x7ff;
++				/* Update the positions.  */
++				if (d->draw_state & VINTAGE2D_DRAW_STATE_MODE_BLIT)
++					d->src_pos = src_pos_x << 8 | src_pos_y << 20;
++				d->dst_pos = dst_pos_x << 8 | dst_pos_y << 20;
++			}
++			/* Update draw_left, count it as one unit of work.  */
++			d->draw_left = left_pixels | left_lines << 12;
++			work_cnt--;
++		} else if (d->status & VINTAGE2D_STATUS_FIFO) {
++			/* No drawing in progress, execute a command if there is one.  */
++			int rptr = VINTAGE2D_FIFO_STATE_READ(d->fifo_state);
++			int wptr = VINTAGE2D_FIFO_STATE_WRITE(d->fifo_state);
++			uint32_t cmd = d->fifo_cmd[rptr & 0x1f];
++			rptr++;
++			rptr &= 0x3f;
++			d->fifo_state = rptr | wptr << 8;
++			switch (VINTAGE2D_CMD_TYPE(cmd)) {
++				case VINTAGE2D_CMD_TYPE_CANVAS_PT:
++					d->canvas_pt = cmd & 0xfffff000;
++					break;
++				case VINTAGE2D_CMD_TYPE_CANVAS_DIMS:
++					d->canvas_dims = cmd & 0x7ff7ff00;
++					break;
++				case VINTAGE2D_CMD_TYPE_SRC_POS:
++					d->src_pos = cmd & 0x7ff7ff00;
++					break;
++				case VINTAGE2D_CMD_TYPE_DST_POS:
++					d->dst_pos = cmd & 0x7ff7ff00;
++					break;
++				case VINTAGE2D_CMD_TYPE_FILL_COLOR:
++					d->fill_color = cmd & 0x0000ff00;
++					break;
++				case VINTAGE2D_CMD_TYPE_DO_BLIT:
++					vintage2d_do_blit(d, cmd);
++					break;
++				case VINTAGE2D_CMD_TYPE_DO_FILL:
++					vintage2d_do_fill(d, cmd);
++					break;
++				case VINTAGE2D_CMD_TYPE_COUNTER:
++					d->counter = cmd & 0xffffff00;
++					break;
++				/* FIFO_SEND rejects other types already.
++				 * If you get one here anyway (by direct
++				 * access to fifo_cmd), it's ignored.  */
++			}
++			if (VINTAGE2D_CMD_KIND(cmd) == VINTAGE2D_CMD_KIND_CMD_NOTIFY) {
++				vintage2d_trigger(d, VINTAGE2D_INTR_NOTIFY);
++			}
++			/* Count commands as 64 lines... */
++			work_cnt -= 0x40;
++		} else {
++			/* Nothing to do.  */
++			return;
++		}
++		vintage2d_status_update(d);
++	}
++}
++
++/* Main loop of the FETCH_CMD unit.  Does a random amount of work.  */
++static void vintage2d_tick_fetch_cmd(V2DdevState *d) {
++	if (!(d->enable & VINTAGE2D_ENABLE_FETCH_CMD))
++		return;
++	/* First, determine how many commands we process this time. */
++	int cmd_cnt = lrand48() % 5;
++	while (cmd_cnt--) {
++		/* First, check if we're still allowed to work. */
++		if (!(d->status & VINTAGE2D_STATUS_FETCH_CMD))
++			return;
++		if (!vintage2d_fifo_free(d))
++			return;
++		/* There are commands to read, and there's somewhere to put them. Do it. */
++		uint8_t cmd[4];
++		uint32_t cmdw;
++		pci_dma_read(&d->dev, d->cmd_read_ptr, &cmd, sizeof cmd);
++		cmdw = le32_read(cmd);
++		d->cmd_read_ptr += sizeof cmd;
++		if (VINTAGE2D_CMD_KIND(cmdw) == VINTAGE2D_CMD_KIND_JUMP) {
++			d->cmd_read_ptr = cmdw & ~3;
++		} else {
++			/* This could cause an INVALID_CMD.  We don't care.  */
++			vintage2d_fifo_send(d, cmdw);
++		}
++		vintage2d_status_update(d);
++	}
++}
++
++/* Main loop of the device.  Does a random amount of work.  */
++static void vintage2d_tick(void *opaque) {
++	V2DdevState *d = opaque;
++	vintage2d_tick_draw(d);
++	vintage2d_tick_fetch_cmd(d);
++	/* Schedule the next appointment. */
++	vintage2d_schedule(d);
++}
++
++/* MMIO write handlers.  */
++static void vintage2d_mmio_writeb(void *opaque, hwaddr addr, uint32_t val)
++{
++	fprintf(stderr, "vintage2d error: byte-sized write at %03x, value %02x\n", (int)addr, val);
++}
++
++static void vintage2d_mmio_writew(void *opaque, hwaddr addr, uint32_t val)
++{
++	fprintf(stderr, "vintage2d error: word-sized write at %03x, value %04x\n", (int)addr, val);
++}
++
++static void vintage2d_mmio_writel(void *opaque, hwaddr addr, uint32_t val)
++{
++	int i;
++	V2DdevState *d = opaque;
++	/* Documented registers... */
++	if (addr == VINTAGE2D_ENABLE) {
++		d->enable = val & (VINTAGE2D_ENABLE_DRAW | VINTAGE2D_ENABLE_FETCH_CMD);
++		if (val & ~(VINTAGE2D_ENABLE_DRAW | VINTAGE2D_ENABLE_FETCH_CMD))
++			fprintf(stderr, "vintage2d error: invalid ENABLE value %08x\n", val);
++		vintage2d_schedule(d);
++		return;
++	}
++	if (addr == VINTAGE2D_INTR) {
++		d->intr &= ~val;
++		if (val & ~0x1f)
++			fprintf(stderr, "vintage2d error: invalid INTR value %08x\n", val);
++		vintage2d_status_update(d);
++		return;
++	}
++	if (addr == VINTAGE2D_INTR_ENABLE) {
++		d->intr_enable = val & 0x1f;
++		if (val & ~0x1f)
++			fprintf(stderr, "vintage2d error: invalid INTR_ENABLE value %08x\n", val);
++		vintage2d_status_update(d);
++		return;
++	}
++	if (addr == VINTAGE2D_RESET) {
++		if (val & VINTAGE2D_RESET_DRAW)
++			vintage2d_reset_draw(d);
++		if (val & VINTAGE2D_RESET_FIFO)
++			vintage2d_reset_fifo(d);
++		if (val & VINTAGE2D_RESET_TLB)
++			vintage2d_reset_tlb(d);
++		if (val & ~0xb)
++			fprintf(stderr, "vintage2d error: invalid RESET value %08x\n", val);
++		return;
++	}
++	if (addr == VINTAGE2D_FIFO_SEND) {
++		vintage2d_fifo_send(d, val);
++		return;
++	}
++	if (addr == VINTAGE2D_CMD_READ_PTR) {
++		if (val & 3) {
++			fprintf(stderr, "vintage2d error: CMD_READ_PTR not aligned\n");
++			val &= ~3;
++		}
++		/* If FETCH_CMD is working, this is a bad idea.  */
++		if ((d->enable & VINTAGE2D_ENABLE_FETCH_CMD))
++			fprintf(stderr, "vintage2d warning: CMD_READ_PTR written while command fetch enabled\n");
++		d->cmd_read_ptr = val;
++		vintage2d_status_update(d);
++		vintage2d_schedule(d);
++		return;
++	}
++	if (addr == VINTAGE2D_CMD_WRITE_PTR) {
++		if (val & 3) {
++			fprintf(stderr, "vintage2d error: CMD_WRITE_PTR not aligned\n");
++			val &= ~3;
++		}
++		d->cmd_write_ptr = val;
++		vintage2d_status_update(d);
++		vintage2d_schedule(d);
++		return;
++	}
++	/* Undocumented registers - direct access to state.  */
++	if (addr == VINTAGE2D_DRAW_STATE_CANVAS_PT) {
++		d->canvas_pt = val & 0xfffff000;
++		return;
++	}
++	if (addr == VINTAGE2D_DRAW_STATE_CANVAS_DIMS) {
++		d->canvas_dims = val & 0x7ff7ff00;
++		return;
++	}
++	if (addr == VINTAGE2D_DRAW_STATE_SRC_POS) {
++		d->src_pos = val & 0x7ff7ff00;
++		return;
++	}
++	if (addr == VINTAGE2D_DRAW_STATE_DST_POS) {
++		d->dst_pos = val & 0x7ff7ff00;
++		return;
++	}
++	if (addr == VINTAGE2D_DRAW_STATE_FILL_COLOR) {
++		d->fill_color = val & 0x0000ff00;
++		return;
++	}
++	/* And direct access to blit/fill starter.  */
++	if (addr == VINTAGE2D_DO_BLIT) {
++		vintage2d_do_blit(d, val);
++		return;
++	}
++	if (addr == VINTAGE2D_DO_FILL) {
++		vintage2d_do_fill(d, val);
++		return;
++	}
++	if (addr == VINTAGE2D_DRAW_STATE_COUNTER) {
++		d->counter = val & 0xffffff00;
++		return;
++	}
++	if (addr == VINTAGE2D_SRC_TLB_TAG) {
++		d->src_tlb_tag = val & 0xfffffffc;
++		return;
++	}
++	if (addr == VINTAGE2D_SRC_TLB_PTE) {
++		d->src_tlb_pte = val & 0xfffff001;
++		return;
++	}
++	if (addr == VINTAGE2D_DST_TLB_TAG) {
++		d->dst_tlb_tag = val & 0xfffffffc;
++		return;
++	}
++	if (addr == VINTAGE2D_DST_TLB_PTE) {
++		d->dst_tlb_pte = val & 0xfffff001;
++		return;
++	}
++	if (addr == VINTAGE2D_DRAW_STATE) {
++		d->draw_state = val & 0x00007ffd;
++		vintage2d_status_update(d);
++		vintage2d_schedule(d);
++		return;
++	}
++	if (addr == VINTAGE2D_DRAW_LEFT) {
++		d->draw_left = val & 0x00ffffff;
++		vintage2d_status_update(d);
++		vintage2d_schedule(d);
++		return;
++	}
++	if (addr == VINTAGE2D_FIFO_STATE) {
++		d->fifo_state = val & 0x00003f3f;
++		return;
++	}
++	for (i = 0; i < VINTAGE2D_FIFO_CMD_NUM; i++) {
++		if (addr == VINTAGE2D_FIFO_CMD(i))
++			d->fifo_cmd[i] = val;
++			return;
++	}
++	fprintf(stderr, "vintage2d error: invalid register write at %03x, value %08x\n", (int)addr, val);
++}
++
++static uint32_t vintage2d_mmio_readb(void *opaque, hwaddr addr)
++{
++	fprintf(stderr, "vintage2d error: byte-sized read at %03x\n", (int)addr);
++	return 0xff;
++}
++
++static uint32_t vintage2d_mmio_readw(void *opaque, hwaddr addr)
++{
++	fprintf(stderr, "vintage2d error: word-sized read at %03x\n", (int)addr);
++	return 0xffff;
++}
++
++static uint32_t vintage2d_mmio_readl(void *opaque, hwaddr addr)
++{
++	V2DdevState *d = opaque;
++	int i;
++	/* Documented registers... */
++	if (addr == VINTAGE2D_ENABLE)
++		return d->enable;
++	if (addr == VINTAGE2D_STATUS)
++		return d->status;
++	if (addr == VINTAGE2D_INTR)
++		return d->intr;
++	if (addr == VINTAGE2D_INTR_ENABLE)
++		return d->intr_enable;
++	/* This one is just a bit-shifted alias of internal state reg.  */
++	if (addr == VINTAGE2D_COUNTER)
++		return d->counter >> 8;
++	if (addr == VINTAGE2D_FIFO_FREE)
++		return vintage2d_fifo_free(d);
++	if (addr == VINTAGE2D_CMD_READ_PTR)
++		return d->cmd_read_ptr;
++	if (addr == VINTAGE2D_CMD_WRITE_PTR)
++		return d->cmd_write_ptr;
++	/* Undocumented registers - direct state access.  */
++	if (addr == VINTAGE2D_DRAW_STATE_CANVAS_PT)
++		return d->canvas_pt;
++	if (addr == VINTAGE2D_DRAW_STATE_CANVAS_DIMS)
++		return d->canvas_dims;
++	if (addr == VINTAGE2D_DRAW_STATE_SRC_POS)
++		return d->src_pos;
++	if (addr == VINTAGE2D_DRAW_STATE_DST_POS)
++		return d->dst_pos;
++	if (addr == VINTAGE2D_DRAW_STATE_FILL_COLOR)
++		return d->fill_color;
++	if (addr == VINTAGE2D_DRAW_STATE_COUNTER)
++		return d->counter;
++	if (addr == VINTAGE2D_SRC_TLB_TAG)
++		return d->src_tlb_tag;
++	if (addr == VINTAGE2D_SRC_TLB_PTE)
++		return d->src_tlb_pte;
++	if (addr == VINTAGE2D_DST_TLB_TAG)
++		return d->dst_tlb_tag;
++	if (addr == VINTAGE2D_DST_TLB_PTE)
++		return d->dst_tlb_pte;
++	if (addr == VINTAGE2D_DRAW_STATE)
++		return d->draw_state;
++	if (addr == VINTAGE2D_DRAW_LEFT)
++		return d->draw_left;
++	if (addr == VINTAGE2D_FIFO_STATE)
++		return d->fifo_state;
++	for (i = 0; i < VINTAGE2D_FIFO_CMD_NUM; i++) {
++		if (addr == VINTAGE2D_FIFO_CMD(i))
++			return d->fifo_cmd[i];
++	}
++	fprintf(stderr, "vintage2d error: invalid register read at %03x\n", (int)addr);
++	return 0xffffffff;
++}
++
++static const MemoryRegionOps vintage2d_mmio_ops = {
++	.old_mmio = {
++		.read = {
++			vintage2d_mmio_readb,
++			vintage2d_mmio_readw,
++			vintage2d_mmio_readl,
++		},
++		.write = {
++			vintage2d_mmio_writeb,
++			vintage2d_mmio_writew,
++			vintage2d_mmio_writel,
++		},
++	},
++	.endianness = DEVICE_NATIVE_ENDIAN,
++};
++
++/* Power-up reset of the device.  */
++static void vintage2d_reset(DeviceState *d)
++{
++	V2DdevState *s = container_of(d, V2DdevState, dev.qdev);
++	int i;
++	/* These registers play fair. */
++	s->enable = 0;
++	s->intr_enable = 0;
++	/* But these don't; hardware is evil. */
++	s->intr = mrand48() & 0x1f;
++	s->cmd_read_ptr = mrand48() & 0xfffffffc;
++	s->cmd_write_ptr = mrand48() & 0xfffffffc;
++	s->canvas_pt = mrand48() & 0xfffff000;
++	s->canvas_dims = mrand48() & 0x7ff7ff00;
++	s->src_pos = mrand48() & 0x7ff7ff00;
++	s->dst_pos = mrand48() & 0x7ff7ff00;
++	s->fill_color = mrand48() & 0x0000ff00;
++	s->counter = mrand48() & 0xffffff00;
++	s->draw_state = mrand48() & 0x00007ffd;
++	s->draw_left = mrand48() & 0x00ffffff;
++	s->src_tlb_tag = mrand48() & 0xfffffffc;
++	s->src_tlb_pte = mrand48() & 0xfffff001;
++	s->dst_tlb_tag = mrand48() & 0xfffffffc;
++	s->dst_tlb_pte = mrand48() & 0xfffff001;
++	s->fifo_state = mrand48() & 0x00003f3f;
++	for (i = 0; i < VINTAGE2D_FIFO_CMD_NUM; i++)
++		s->fifo_cmd[i] = mrand48();
++	vintage2d_status_update(s);
++}
++
++static int vintage2d_init(PCIDevice *pci_dev)
++{
++	V2DdevState *d = DO_UPCAST(V2DdevState, dev, pci_dev);
++	uint8_t *pci_conf = d->dev.config;
++
++	pci_config_set_interrupt_pin(pci_conf, 1);
++
++	memory_region_init_io(&d->mmio, OBJECT(d), &vintage2d_mmio_ops, d, "vintage2d", 0x1000);
++	pci_register_bar(&d->dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
++
++	vintage2d_reset(&pci_dev->qdev);
++	d->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vintage2d_tick, d);
++
++	return 0;
++}
++
++static void vintage2d_exit(PCIDevice *pci_dev)
++{
++	V2DdevState *d = DO_UPCAST(V2DdevState, dev, pci_dev);
++
++	timer_free(d->timer);
++}
++
++static Property vintage2d_properties[] = {
++	DEFINE_PROP_END_OF_LIST(),
++};
++
++static void vintage2d_class_init(ObjectClass *klass, void *data)
++{
++	DeviceClass *dc = DEVICE_CLASS(klass);
++	PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++
++	k->init = vintage2d_init;
++	k->exit = vintage2d_exit;
++	k->vendor_id = VINTAGE2D_VENDOR_ID;
++	k->device_id = VINTAGE2D_DEVICE_ID;
++	k->class_id = PCI_CLASS_PROCESSOR_CO;
++	dc->reset = vintage2d_reset;
++	dc->vmsd = &vmstate_vintage2d;
++	dc->props = vintage2d_properties;
++}
++
++static TypeInfo vintage2d_info = {
++	.name          = "vintage2d",
++	.parent        = TYPE_PCI_DEVICE,
++	.instance_size = sizeof(V2DdevState),
++	.class_init    = vintage2d_class_init,
++};
++
++static void vintage2d_register_types(void)
++{
++	type_register_static(&vintage2d_info);
++}
++
++type_init(vintage2d_register_types)
+diff --git a/hw/misc/vintage2d.h b/hw/misc/vintage2d.h
+new file mode 100644
+index 0000000..2018638
+--- /dev/null
++++ b/hw/misc/vintage2d.h
+@@ -0,0 +1,103 @@
++#ifndef VINTAGE2D_H
++#define VINTAGE2D_H
++
++/* PCI ids */
++
++#define VINTAGE2D_VENDOR_ID		0x1af4
++#define VINTAGE2D_DEVICE_ID		0x10f2
++
++/* Registers */
++
++#define VINTAGE2D_ENABLE			0x000
++#define VINTAGE2D_ENABLE_DRAW			0x00000001
++#define VINTAGE2D_ENABLE_FETCH_CMD		0x00000004
++#define VINTAGE2D_STATUS			0x004
++#define VINTAGE2D_STATUS_DRAW			0x00000001
++#define VINTAGE2D_STATUS_FIFO			0x00000002
++#define VINTAGE2D_STATUS_FETCH_CMD		0x00000004
++#define VINTAGE2D_INTR				0x008
++#define VINTAGE2D_INTR_NOTIFY			0x00000001
++#define VINTAGE2D_INTR_INVALID_CMD		0x00000002
++#define VINTAGE2D_INTR_PAGE_FAULT		0x00000004
++#define VINTAGE2D_INTR_CANVAS_OVERFLOW		0x00000008
++#define VINTAGE2D_INTR_FIFO_OVERFLOW		0x00000010
++#define VINTAGE2D_INTR_ENABLE			0x00c
++#define VINTAGE2D_RESET				0x010
++#define VINTAGE2D_RESET_DRAW			0x00000001
++#define VINTAGE2D_RESET_FIFO			0x00000002
++#define VINTAGE2D_RESET_TLB			0x00000008
++#define VINTAGE2D_COUNTER			0x014
++#define VINTAGE2D_FIFO_SEND			0x018
++#define VINTAGE2D_FIFO_FREE			0x01c
++#define VINTAGE2D_CMD_READ_PTR			0x020
++#define VINTAGE2D_CMD_WRITE_PTR			0x024
++#define VINTAGE2D_DRAW_STATE_CANVAS_PT		0x040
++#define VINTAGE2D_DRAW_STATE_CANVAS_DIMS	0x044
++#define VINTAGE2D_DRAW_STATE_SRC_POS		0x048
++#define VINTAGE2D_DRAW_STATE_DST_POS		0x04c
++#define VINTAGE2D_DRAW_STATE_FILL_COLOR		0x050
++#define VINTAGE2D_DO_BLIT			0x054
++#define VINTAGE2D_DO_FILL			0x058
++#define VINTAGE2D_DRAW_STATE_COUNTER		0x05c
++#define VINTAGE2D_SRC_TLB_TAG			0x060
++#define VINTAGE2D_SRC_TLB_TAG_PT(tag)		((tag) & 0xfffff000)
++#define VINTAGE2D_SRC_TLB_TAG_IDX(tag)		((tag) >> 2 & 0x3ff)
++#define VINTAGE2D_SRC_TLB_PTE			0x064
++#define VINTAGE2D_DST_TLB_TAG			0x068
++#define VINTAGE2D_DST_TLB_TAG_PT(tag)		((tag) & 0xfffff000)
++#define VINTAGE2D_DST_TLB_TAG_IDX(tag)		((tag) >> 2 & 0x3ff)
++#define VINTAGE2D_DST_TLB_PTE			0x06c
++#define VINTAGE2D_DRAW_STATE			0x070
++#define VINTAGE2D_DRAW_STATE_MODE_BLIT		0x000000001
++#define VINTAGE2D_DRAW_STATE_DIR_X_LEFT		0x000000004
++#define VINTAGE2D_DRAW_STATE_DIR_Y_UP		0x000000008
++#define VINTAGE2D_DRAW_STATE_WIDTHM1(st)	((st) >> 4 & 0x7ff)
++#define VINTAGE2D_DRAW_LEFT			0x074
++#define VINTAGE2D_DRAW_LEFT_PIXELS(st)		((st) & 0xfff)
++#define VINTAGE2D_DRAW_LEFT_LINES(st)		((st) >> 12 & 0xfff)
++#define VINTAGE2D_FIFO_STATE			0x078
++#define VINTAGE2D_FIFO_STATE_READ(st)		((st) & 0x3f)
++#define VINTAGE2D_FIFO_STATE_WRITE(st)		((st) >> 8 & 0x3f)
++#define VINTAGE2D_FIFO_CMD(x)			(0x080 + (x) * 4)
++#define VINTAGE2D_FIFO_CMD_NUM			0x20
++
++/* Commands */
++
++#define VINTAGE2D_CMD_TYPE(cmd)			((cmd) & 0xfc)
++#define VINTAGE2D_CMD_TYPE_CANVAS_PT		0x00
++#define VINTAGE2D_CMD_TYPE_CANVAS_DIMS		0x04
++#define VINTAGE2D_CMD_TYPE_SRC_POS		0x08
++#define VINTAGE2D_CMD_TYPE_DST_POS		0x0c
++#define VINTAGE2D_CMD_TYPE_FILL_COLOR		0x10
++#define VINTAGE2D_CMD_TYPE_DO_BLIT		0x14
++#define VINTAGE2D_CMD_TYPE_DO_FILL		0x18
++#define VINTAGE2D_CMD_TYPE_COUNTER		0x1c
++#define VINTAGE2D_CMD_KIND(cmd)			((cmd) & 3)
++#define VINTAGE2D_CMD_KIND_CMD			0
++#define VINTAGE2D_CMD_KIND_CMD_NOTIFY		1
++#define VINTAGE2D_CMD_KIND_JUMP			2
++
++#define VINTAGE2D_CMD_CANVAS_PT(addr, notify)	(VINTAGE2D_CMD_TYPE_CANVAS_PT | addr | notify)
++#define VINTAGE2D_CMD_CANVAS_DIMS(w, h, notify)	(VINTAGE2D_CMD_TYPE_CANVAS_DIMS | ((w) - 1) << 8 | ((h) - 1) << 20 | (notify))
++#define VINTAGE2D_CMD_SRC_POS(x, y, notify)	(VINTAGE2D_CMD_TYPE_SRC_POS | (x) << 8 | (y) << 20 | (notify))
++#define VINTAGE2D_CMD_DST_POS(x, y, notify)	(VINTAGE2D_CMD_TYPE_DST_POS | (x) << 8 | (y) << 20 | (notify))
++#define VINTAGE2D_CMD_FILL_COLOR(c, notify)	(VINTAGE2D_CMD_TYPE_FILL_COLOR | (c) << 8 | (notify))
++#define VINTAGE2D_CMD_DO_BLIT(w, h, notify)	(VINTAGE2D_CMD_TYPE_DO_BLIT | ((w) - 1) << 8 | ((h) - 1) << 20 | (notify))
++#define VINTAGE2D_CMD_DO_FILL(w, h, notify)	(VINTAGE2D_CMD_TYPE_DO_FILL | ((w) - 1) << 8 | ((h) - 1) << 20 | (notify))
++#define VINTAGE2D_CMD_COUNTER(ctr, notify)	(VINTAGE2D_CMD_TYPE_COUNTER | (ctr) << 8 | (notify))
++
++#define VINTAGE2D_CMD_PT(cmd)			((cmd) & 0xfffff000)
++#define VINTAGE2D_CMD_POS_X(cmd)		((cmd) >> 8 & 0x7ff)
++#define VINTAGE2D_CMD_POS_Y(cmd)		((cmd) >> 20 & 0x7ff)
++#define VINTAGE2D_CMD_WIDTH(cmd)		(((cmd) >> 8 & 0x7ff) + 1)
++#define VINTAGE2D_CMD_HEIGHT(cmd)		(((cmd) >> 20 & 0x7ff) + 1)
++#define VINTAGE2D_CMD_COLOR(cmd)		((cmd) >> 8 & 0xff)
++#define VINTAGE2D_CMD_COUNTER_VALUE(cmd)	((cmd) >> 8 & 0xffffff)
++
++/* Page tables */
++
++#define VINTAGE2D_PTE_VALID		0x00000001
++#define VINTAGE2D_PAGE_SHIFT		12
++#define VINTAGE2D_PAGE_SIZE		0x1000
++
++#endif

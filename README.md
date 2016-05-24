@@ -1,14 +1,6 @@
 # Vintage2D
 
-Dużo bazowałem na ubiegłorocznej wzorcówce. Przekazuję urządzeniu przez DMA tablicę stron przy podmianie canvasa oraz
-przez bufor w DMA przekazuję komendy (na końcu bufora trzymam JUMP na początek). Stan tej kolejki symuluję też wewnątrz
-sterownika - po każdej paczce (poprawne ustawenia, fill/blit) wstawiam komendę COUNTER z monotnicznym licznikiem
-pozwalającym mi na zorientowanie się ile pozycji zostało już z kolejki zdjęte (śledzę stan licznika na podstawie diffa
-z najnowszego odczytanego i poprzedniego modulo 2^24, w ten sposób unikam problemów z przekręceniem). Licznik pozwala mi
-też realizować fsync (odwieszam odpowiednie kolejki). Licznik pobieram kiedy przyjdzie do mnie wyzwolone przez niego przerwanie NOTIFY.
+This is a driver for a simple 2D graphics card.
 
-Jeśli nie ma miejsca na write w kolejce, wieszam się na kolejce oczekiwania dla zapisu do kolejki. Tę kolejkę odwieszam, jeśli dostanę NOTIFY ze zmianą countera i wiem, że wykonałem chociaż jedną komendę (odwieszam po przesunięciu lokalnej głowy kolejki).
-
-Ogon kolejki na karcie (WRITE_PTR) synchronizuję z moim ogonem. Głowę mojej kolejki, synchronizuję z głową na urządzeniu za pomocą wspomnianych liczników.
-
-Zapewniam cache koherencę korzystając z bezpiecznych funkcji dma do alokacji bloków pamięci.
+The qemu patch for qemu-2.5.1 that emulates the device is in docs/. The official spec of the device (in Polish) can be found [here](http://students.mimuw.edu.pl/ZSO/PUBLIC-SO/2015-2016/_build/html/z2_driver/vintage2d.html#z2-vintage2d)
+and the task (in Polish as well) can be found [here](http://students.mimuw.edu.pl/ZSO/PUBLIC-SO/2015-2016/_build/html/z2_driver/index.html).
